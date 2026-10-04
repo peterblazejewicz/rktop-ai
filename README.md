@@ -24,9 +24,11 @@ A high-performance system monitoring tool for Rockchip SoC devices (RK3576, RK35
 - **Host DDR / DMC (Dynamic Memory Controller)**: Current frequency, active governor, available frequencies, and governors via devfreq
 - **PCIe AI Accelerator (RK1828 / RM1828MC0-F)**:
   - Real-time NPU utilization percentage, clock frequency, and sparkline history
-  - Dedicated onboard VRAM gauge (e.g. `1600 MB / 5120 MB` LPDDR)
+  - Dedicated onboard VRAM gauge (e.g. `1638 MB / 5120 MB` LPDDR)
   - Coprocessor CPU load and operating frequency
-  - Work mode, DDR frequency, and available NPU frequencies
+  - Work and Prefill modes (`PERFORMANCE`, `NORMAL`, `EFFICIENT`)
+  - Dedicated DDR clock rate (`400 MHz`)
+  - Available NPU frequency steps (`400, 500, 850 MHz`) and CPU frequency steps (`950–1310 MHz`)
   - Board temperature, power consumption (mW), PCIe bus ID (`0000:01:00.0`), and card health
 - **RGA**: 2D graphics accelerator scheduler load across all RGA cores
 - **Memory**: RAM, Swap, and ZRAM usage with compression ratio and breakdown
@@ -36,7 +38,8 @@ A high-performance system monitoring tool for Rockchip SoC devices (RK3576, RK35
 ### Process & Thread Affinity Profiling
 - **Interactive Sorting**: Sort by CPU, Memory, PID, or Name (ascending/descending)
 - **Detailed Metrics**: PID, User, Nice level, CPU core affinity, Runtime, CPU%, Memory%
-- **Named Process Tracking (`--proc`)**: Inspect specific AI engines (e.g. `rkllm3-server`, `proxy`) with thread-to-core affinity distribution across Little Cortex-A53 cores (0–3) vs Big Cortex-A72 cores (4–7)
+- **Named Process Tracking (`--proc`)**: Inspect specific AI engines (e.g. `rkllm3-server`, `python -m functiongemma_rkllm`) with thread-to-core affinity distribution across Little Cortex-A53 cores (0–3) vs Big Cortex-A72 cores (4–7)
+- **Thread Deduplication via TGID**: Groups secondary worker threads cleanly under the main process PID while exposing per-thread core placement
 - **Dynamic Display**: Adaptive layout fitting any terminal dimensions
 
 ### System Statistics & Version Probing
@@ -136,9 +139,9 @@ sudo rktop-ai
 |:---|:---:|:---|
 | `--json` | `-j` | Output a complete structured JSON telemetry snapshot to stdout and exit |
 | `--oneshot` | `-1` | Print a clean, formatted ASCII text summary to stdout and exit |
-| `--stream [MS]` | `-s` | Continuously stream NDJSON snapshots at sub-second interval (default: 500ms, e.g. `-s 200`) |
+| `--stream [MS]` | `-s` | Continuously stream NDJSON snapshots at sub-second intervals with drift-compensated monotonic timing and `timestamp_unix_ms` (default: 500ms, e.g. `-s 200`) |
 | `--watch [SECS]` | `-w` | Continuously stream NDJSON snapshots at second intervals (e.g. `-w 1`) |
-| `--proc <names>` | `-p` | Filter & profile named processes and thread CPU core placement (comma-separated, e.g. `-p rkllm,proxy`) |
+| `--proc <names>` | `-p` | Filter & profile named processes, full command lines, and thread CPU core placement (comma-separated, e.g. `-p rkllm,proxy,functiongemma`) |
 | `--help` | `-h` | Display usage instructions and CLI options |
 | `--version` | `-v` | Display version information |
 
@@ -159,36 +162,44 @@ sudo rktop-ai --json | jq .accelerator
 #   "device_id": 0,
 #   "chip_name": "RK1828",
 #   "bus_id": "0000:01:00.0",
-#   "health": "OK",
-#   "npu_load_pct": 76,
+#   "temp_celsius": 45,
+#   "power_mw": null,
+#   "cpu_load_pct": 0,
+#   "cpu_freq_mhz": 1000,
+#   "npu_load_pct": 0,
 #   "npu_freq_mhz": 850,
 #   "memory_used_mb": 1638,
 #   "memory_total_mb": 5120,
-#   "cpu_load_pct": 0,
-#   "cpu_freq_mhz": 1000,
-#   "temp_celsius": 45,
-#   "power_mw": null
+#   "health": "OK",
+#   "work_mode": "PERFORMANCE",
+#   "prefill_mode": "PERFORMANCE",
+#   "ddr_freq_mhz": 400,
+#   "available_npu_freqs_mhz": [400, 500, 850],
+#   "available_cpu_freqs_mhz": [950, 1000, 1100, 1200, 1300, 1310]
 # }
 
 # Inspect Host DDR (DMC) frequency and active governor
 sudo rktop-ai --json | jq .dmc
 # Output:
 # {
-#   "freq_mhz": 1056,
+#   "freq_mhz": 534,
 #   "governor": "dmc_ondemand",
-#   "available_frequencies_mhz": [328, 528, 784, 1056],
+#   "available_frequencies_mhz": [534, 1320, 1968, 2736],
 #   "available_governors": ["dmc_ondemand", "userspace", "powersave", "performance"]
 # }
 
 # Profile specific AI processes and inspect thread affinity on Big vs Little cores
-sudo rktop-ai --json --proc rkllm3-server,proxy | jq '.tracked_processes[] | {name, cpu_pct, rss_mb, thread_count, little_cores_count, big_cores_count}'
+sudo rktop-ai --json --proc rkllm3-server,functiongemma | jq '.tracked_processes[] | {name, cpu_pct, rss_mb, thread_count, little_cores_count, big_cores_count}'
 
-# Sub-second continuous streaming (NDJSON) to resolve rapid LLM prefill phases (e.g. every 200ms)
-sudo rktop-ai --stream 200 --proc rkllm3-server | jq -c '{time: .timestamp_unix, npu: .accelerator.npu_load_pct, rkllm_cpu: .tracked_processes[0].cpu_pct}'
+# Sub-second continuous streaming (NDJSON) with millisecond timestamps to resolve rapid LLM prefill phases (e.g. every 200ms)
+sudo rktop-ai --stream 200 --proc rkllm3-server | jq -c '{time_ms: .timestamp_unix_ms, dmc: .dmc.freq_mhz, rkllm_cpu: .tracked_processes[0].cpu_pct, npu: .accelerator.npu_load_pct}'
 
 # Human-readable one-shot diagnostic print
 sudo rktop-ai --oneshot
 ```
+
+> [!NOTE]
+> In continuous streaming mode (`--stream`), the first snapshot acts as the baseline for CPU delta counters (reporting `cpu_pct: 0` for processes on the initial tick), while all subsequent snapshots compute real-time delta utilization. Secondary threads sharing a thread group leader are automatically deduplicated into `threads` array with individual core placement.
 
 ### Running Without Root (Optional)
 
