@@ -12,7 +12,7 @@ use std::time::Duration;
 use std::os::unix::process::CommandExt;
 
 /// Telemetry metrics for PCIe AI Accelerator (e.g. RK1828)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 #[allow(dead_code)]
 pub struct AcceleratorMetrics {
     pub device_id: u32,

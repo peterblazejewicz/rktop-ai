@@ -80,16 +80,18 @@ cargo build --release
 
 ### Cross-Compiling for aarch64 (Linux / WSL2)
 
-Cross-compilation from Ubuntu/WSL2 targeting 64-bit ARM:
+Cross-compilation from Ubuntu / WSL2 targeting 64-bit ARM. For maximum compatibility across various embedded Linux distributions (avoiding `GLIBC_xxx not found` errors), building a statically linked musl binary is recommended:
 
 ```bash
-# Install GCC aarch64 toolchain
-sudo apt-get install -y gcc-aarch64-linux-gnu
-
-# Add Rust target
+# Add targets
+rustup target add aarch64-unknown-linux-musl
 rustup target add aarch64-unknown-linux-gnu
 
-# Build and strip
+# Recommended: Statically linked binary (zero dynamic libc dependencies)
+cargo build --target aarch64-unknown-linux-musl --release
+aarch64-linux-gnu-strip target/aarch64-unknown-linux-musl/release/rktop-ai
+
+# Or dynamically linked binary:
 cargo build --target aarch64-unknown-linux-gnu --release
 aarch64-linux-gnu-strip target/aarch64-unknown-linux-gnu/release/rktop-ai
 ```
@@ -106,7 +108,7 @@ sudo chmod +x /usr/local/bin/rktop-ai
 
 ## Usage
 
-### Basic Usage
+### Interactive TUI Mode
 
 ```bash
 # Run with root privileges (required for debugfs access)
@@ -122,6 +124,56 @@ sudo rktop-ai
 | `m` | Toggle Memory sort (ascending / descending) |
 | `p` | Toggle PID sort (ascending / descending) |
 | `n` | Toggle Name sort (ascending / descending) |
+
+### CLI Options & Non-Interactive Snapshot Modes
+
+`rktop-ai` provides non-interactive output modes designed for **agentic AI workflows** (e.g. Claude Code or autonomous daemons running directly on the board), telemetry pipelines, and script automation:
+
+| Option | Short | Description |
+|:---|:---:|:---|
+| `--json` | `-j` | Output a complete structured JSON telemetry snapshot to stdout and exit |
+| `--oneshot` | `-1` | Print a clean, formatted ASCII text summary to stdout and exit |
+| `--help` | `-h` | Display usage instructions and CLI options |
+| `--version` | `-v` | Display version information |
+
+---
+
+## Agentic AI Workflow Integration
+
+When running AI coding assistants (such as **Claude Code**) or autonomous agents directly on Rockchip embedded platforms, TUI interfaces cannot be easily consumed. `rktop-ai` provides structured telemetry snapshots so agents can inspect hardware utilization, detect thermal throttling, and verify model offloading in real time:
+
+```bash
+# Full system telemetry in JSON format
+sudo rktop-ai --json | jq .
+
+# Inspect dedicated PCIe AI Accelerator metrics
+sudo rktop-ai --json | jq .accelerator
+# Output:
+# {
+#   "device_id": 0,
+#   "chip_name": "RK1828",
+#   "bus_id": "0000:01:00.0",
+#   "health": "OK",
+#   "npu_load_pct": 76,
+#   "npu_freq_mhz": 850,
+#   "memory_used_mb": 1638,
+#   "memory_total_mb": 5120,
+#   "cpu_load_pct": 0,
+#   "cpu_freq_mhz": 1000,
+#   "temp_celsius": 45,
+#   "power_mw": null
+# }
+
+# Inspect Host RKNPU2 core load & frequency
+sudo rktop-ai --json | jq .host_npu
+
+# Script-friendly VRAM and load queries
+VRAM_USED=$(sudo rktop-ai --json | jq -r '.accelerator.memory_used_mb')
+echo "PCIe Accelerator VRAM: ${VRAM_USED} MB"
+
+# Human-readable one-shot diagnostic print
+sudo rktop-ai --oneshot
+```
 
 ### Running Without Root (Optional)
 
@@ -171,6 +223,7 @@ rktop-ai
 ### Multi-Module Design
 
 - **`src/main.rs`** — Ratatui TUI rendering, event loop, double-buffered terminal layouts, and state management.
+- **`src/snapshot.rs`** — Non-interactive JSON (`--json`) and one-shot ASCII (`--oneshot`) telemetry generation for agentic workflows and scripts.
 - **`src/accelerator.rs`** — PCIe AI accelerator monitor, async stream parser, zero-orphan process lifecycle management.
 - **`src/hardware.rs`** — Dynamic devfreq scanning, Rockchip SoC probing, RKNPU2, GPU, and RGA telemetry.
 - **`src/file_cache.rs`** — Open file descriptor pool eliminating repetitive `open()` / `close()` syscalls.

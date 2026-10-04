@@ -21,10 +21,12 @@ mod hardware;
 mod sysinfo_ext;
 mod file_cache;
 mod accelerator;
+mod snapshot;
 
 use hardware::*;
 use sysinfo_ext::*;
 use accelerator::*;
+use snapshot::{print_json_snapshot, print_oneshot_snapshot};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ProcessSortMode {
@@ -59,11 +61,63 @@ impl Default for RefreshConfig {
     }
 }
 
+fn print_help() {
+    println!("rktop-ai {} - Rockchip System & AI Accelerator Monitor", env!("CARGO_PKG_VERSION"));
+    println!();
+    println!("USAGE:");
+    println!("    rktop-ai [OPTIONS]");
+    println!();
+    println!("OPTIONS:");
+    println!("    -j, --json       Output a single JSON telemetry snapshot to stdout and exit");
+    println!("    -1, --oneshot    Output a single plaintext telemetry snapshot to stdout and exit");
+    println!("    -v, --version    Print version information and exit");
+    println!("    -h, --help       Print this help message and exit");
+    println!();
+    println!("INTERACTIVE TUI CONTROLS:");
+    println!("    q, Q, Esc        Quit");
+    println!("    c / m / p / n    Sort processes by CPU / Memory / PID / Name");
+    println!("    /                Filter processes by name");
+    println!();
+    println!("AGENTIC AI USAGE EXAMPLE:");
+    println!("    sudo rktop-ai --json | jq .accelerator");
+}
+
 fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+
+    for arg in args.iter().skip(1) {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                print_help();
+                return Ok(());
+            }
+            "-v" | "--version" => {
+                println!("rktop-ai {}", env!("CARGO_PKG_VERSION"));
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+
     // Check for root permissions
     if !nix::unistd::geteuid().is_root() {
         eprintln!("Root permissions required. Use: sudo rktop-ai");
         std::process::exit(1);
+    }
+
+    // Handle non-interactive snapshot modes (for AI agents, scripts, and monitoring)
+    let is_json = args.iter().skip(1).any(|a| a == "-j" || a == "--json");
+    let is_oneshot = args.iter().skip(1).any(|a| a == "-1" || a == "--oneshot");
+
+    if is_json || is_oneshot {
+        let mut sys = System::new_all();
+        let mut app_state = AppState::new();
+        if is_json {
+            print_json_snapshot(&mut sys, &mut app_state);
+        } else {
+            print_oneshot_snapshot(&mut sys, &mut app_state);
+        }
+        return Ok(());
     }
 
     // Setup terminal
@@ -93,76 +147,76 @@ fn main() -> Result<()> {
     result
 }
 
-struct AppState {
-    prev_disk_read: u64,
-    prev_disk_write: u64,
-    prev_net_rx: u64,
-    prev_net_tx: u64,
-    prev_time: Instant,
-    disk_read_rate: f64,
-    disk_write_rate: f64,
-    net_rx_rate: f64,
-    net_tx_rate: f64,
+pub struct AppState {
+    pub prev_disk_read: u64,
+    pub prev_disk_write: u64,
+    pub prev_net_rx: u64,
+    pub prev_net_tx: u64,
+    pub prev_time: Instant,
+    pub disk_read_rate: f64,
+    pub disk_write_rate: f64,
+    pub net_rx_rate: f64,
+    pub net_tx_rate: f64,
     // Per-adapter network stats
-    prev_adapter_stats: HashMap<String, (u64, u64)>, // (rx, tx)
-    adapter_rates: HashMap<String, (f64, f64)>,      // (rx_rate, tx_rate)
+    pub prev_adapter_stats: HashMap<String, (u64, u64)>, // (rx, tx)
+    pub adapter_rates: HashMap<String, (f64, f64)>,      // (rx_rate, tx_rate)
     // Cached static info
-    board_name: String,
-    rk_model: String,
-    hostname: String,
-    kernel_version: String,
-    cpu_arch: String,
-    npu_version: String,
-    rga_version: String,
-    rknn_version: String,
-    rkllm_version: String,
+    pub board_name: String,
+    pub rk_model: String,
+    pub hostname: String,
+    pub kernel_version: String,
+    pub cpu_arch: String,
+    pub npu_version: String,
+    pub rga_version: String,
+    pub rknn_version: String,
+    pub rkllm_version: String,
     // Cached hardware availability
-    has_gpu: bool,
-    has_npu: bool,
-    has_rga: bool,
-    has_accelerator: bool,
-    accelerator: Option<AcceleratorMonitor>,
+    pub has_gpu: bool,
+    pub has_npu: bool,
+    pub has_rga: bool,
+    pub has_accelerator: bool,
+    pub accelerator: Option<AcceleratorMonitor>,
     // Cached CPU frequency ranges (don't change at runtime)
-    cpu_freq_ranges: Vec<(u32, u32)>,
+    pub cpu_freq_ranges: Vec<(u32, u32)>,
     // Cached network adapters (to avoid scanning /sys/class/net repeatedly)
-    network_adapters: Vec<String>,
+    pub network_adapters: Vec<String>,
     // Cached thermal zone paths (to avoid directory scanning)
-    thermal_zone_paths: Vec<(String, String, String)>, // (label, temp_path, type_path)
+    pub thermal_zone_paths: Vec<(String, String, String)>, // (label, temp_path, type_path)
     // Cached stats (updated periodically, not every frame)
-    cpu_governor: String,
-    tcp_connections: usize,
-    last_stats_update: Instant,
+    pub cpu_governor: String,
+    pub tcp_connections: usize,
+    pub last_stats_update: Instant,
     // Process sorting
-    process_sort_mode: ProcessSortMode,
+    pub process_sort_mode: ProcessSortMode,
     // CPU stats tracking (for calculating rates)
-    prev_ctx_switches: u64,
-    prev_interrupts: u64,
-    prev_softirqs: u64,
-    ctx_switches_rate: u64,
-    interrupts_rate: u64,
-    softirqs_rate: u64,
-    prev_cpu_stats_time: Instant,
+    pub prev_ctx_switches: u64,
+    pub prev_interrupts: u64,
+    pub prev_softirqs: u64,
+    pub ctx_switches_rate: u64,
+    pub interrupts_rate: u64,
+    pub softirqs_rate: u64,
+    pub prev_cpu_stats_time: Instant,
     // CPU time breakdown (percentages)
-    cpu_user_pct: f64,
-    cpu_system_pct: f64,
-    cpu_iowait_pct: f64,
-    cpu_idle_pct: f64,
-    prev_cpu_time: CpuStats,
+    pub cpu_user_pct: f64,
+    pub cpu_system_pct: f64,
+    pub cpu_iowait_pct: f64,
+    pub cpu_idle_pct: f64,
+    pub prev_cpu_time: CpuStats,
     // Process counts
-    running_procs: u64,
-    blocked_procs: u64,
+    pub running_procs: u64,
+    pub blocked_procs: u64,
     // Historical data for sparklines (last 60 samples at 1 second each)
-    cpu_history: VecDeque<f32>,
-    gpu_history: VecDeque<f32>,
-    npu_history: VecDeque<f32>,
-    accelerator_history: VecDeque<f32>,
+    pub cpu_history: VecDeque<f32>,
+    pub gpu_history: VecDeque<f32>,
+    pub npu_history: VecDeque<f32>,
+    pub accelerator_history: VecDeque<f32>,
     // Process filtering
-    filter_text: String,
-    filter_mode: bool, // true when actively editing filter
+    pub filter_text: String,
+    pub filter_mode: bool, // true when actively editing filter
 }
 
 impl AppState {
-    fn new() -> Self {
+    pub fn new() -> Self {
         // Cache all static system info at startup (expensive operations)
         let board_name = get_board_name();
         let rk_model = get_rk_model();
@@ -288,7 +342,7 @@ impl AppState {
         }
     }
 
-    fn update_cpu_stats(&mut self) {
+    pub fn update_cpu_stats(&mut self) {
         // Update CPU stats every second for smooth rates
         let cpu_stats = get_cpu_stats();
         let elapsed = self.prev_cpu_stats_time.elapsed().as_secs_f64();
@@ -330,7 +384,7 @@ impl AppState {
         }
     }
 
-    fn update_stats(&mut self) {
+    pub fn update_stats(&mut self) {
         // Update stats every 5 seconds instead of every frame
         if self.last_stats_update.elapsed() < Duration::from_secs(5) {
             return;

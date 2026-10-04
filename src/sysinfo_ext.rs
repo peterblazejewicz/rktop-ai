@@ -1,3 +1,4 @@
+use serde::Serialize;
 use std::collections::HashMap;
 use std::fs;
 use std::sync::Mutex;
@@ -23,7 +24,7 @@ pub struct ProcessInfo {
     pub num_threads: u32, // Number of threads in this process
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ZramInfo {
     pub orig_data_size: u64,
     pub compr_data_size: u64,
