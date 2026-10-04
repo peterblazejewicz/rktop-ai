@@ -83,8 +83,13 @@ fn print_help() {
     println!();
     println!("AGENTIC AI USAGE EXAMPLES:");
     println!("    sudo rktop-ai --json | jq .accelerator");
-    println!("    sudo rktop-ai --stream 100 --proc rkllm3-server,proxy");
-    println!("    sudo rktop-ai --oneshot --proc rkllm");
+    println!("    sudo rktop-ai --stream 200 --proc rkllm3-server");
+    println!("    sudo rktop-ai --oneshot --proc rkllm,proxy");
+    println!();
+    println!("NOTES:");
+    println!("    * Sub-second streaming (--stream) emits Newline-Delimited JSON (NDJSON) with 'timestamp_unix_ms'.");
+    println!("    * The first sampling interval establishes the baseline delta for process CPU% measurements.");
+    println!("    * Secondary threads are grouped under the main process PID with individual core placement in 'threads'.");
 }
 
 fn main() -> Result<()> {

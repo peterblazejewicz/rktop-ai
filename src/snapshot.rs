@@ -9,7 +9,9 @@ use crate::hardware::{
     get_dmc_governor, get_gpu_frequency, get_gpu_usage, get_npu_frequency, get_npu_load,
     get_rga_load, get_thermal_cached,
 };
-use crate::sysinfo_ext::{get_tracked_processes, get_zram_info, ProcessAffinityProfile, ZramInfo};
+use crate::sysinfo_ext::{
+    get_tracked_processes, get_zram_info, is_secondary_thread, ProcessAffinityProfile, ZramInfo,
+};
 use crate::AppState;
 
 #[derive(Serialize)]
@@ -23,6 +25,7 @@ pub struct DmcSnapshot {
 #[derive(Serialize)]
 pub struct SystemSnapshot {
     pub timestamp_unix: u64,
+    pub timestamp_unix_ms: u64,
     pub host: HostInfo,
     pub cpu: CpuSnapshot,
     pub memory: MemorySnapshot,
@@ -99,7 +102,11 @@ pub fn collect_snapshot(
     app_state: &mut AppState,
     tracked_patterns: &[String],
 ) -> SystemSnapshot {
-    // Refresh CPU stats with two measurements to compute accurate usage
+    // Refresh CPU and processes with two measurements separated by 250ms sleep
+    // to establish a baseline delta for both CPU load and process cpu_usage%
+    if !tracked_patterns.is_empty() {
+        sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    }
     sys.refresh_cpu_all();
     std::thread::sleep(Duration::from_millis(250));
     sys.refresh_cpu_all();
@@ -140,10 +147,11 @@ fn build_snapshot_internal(
     app_state: &AppState,
     tracked_patterns: &[String],
 ) -> SystemSnapshot {
-    let timestamp_unix = SystemTime::now()
+    let now_duration = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+        .unwrap_or_default();
+    let timestamp_unix = now_duration.as_secs();
+    let timestamp_unix_ms = now_duration.as_millis() as u64;
 
     let per_core_pct: Vec<f32> = sys.cpus().iter().map(|c| c.cpu_usage()).collect();
     let per_core_freq_mhz: Vec<u32> = sys.cpus().iter().map(|c| c.frequency() as u32).collect();
@@ -239,6 +247,7 @@ fn build_snapshot_internal(
 
     SystemSnapshot {
         timestamp_unix,
+        timestamp_unix_ms,
         host,
         cpu,
         memory,
@@ -307,14 +316,37 @@ pub fn stream_json_snapshots(
         }
     }
 
+    let current_pid = std::process::id();
     let find_pids = |system: &System| -> Vec<sysinfo::Pid> {
         let mut pids = Vec::new();
         for (pid, process) in system.processes() {
+            let pid_u32 = pid.as_u32();
+            if pid_u32 == current_pid || is_secondary_thread(pid_u32) {
+                continue;
+            }
             let name = process.name().to_string_lossy();
-            let cmdline = process.cmd().iter().map(|s| s.to_string_lossy()).collect::<Vec<_>>().join(" ");
+            let name_lower = name.to_lowercase();
+            if name_lower == "sudo" || name_lower == "timeout" || name_lower == "rktop-ai" || name_lower == "grep" {
+                continue;
+            }
+            let exe_name = process
+                .exe()
+                .and_then(|p| p.file_name())
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
             let matches = tracked_patterns.iter().any(|pat| {
                 let pat_lower = pat.to_lowercase();
-                name.to_lowercase().contains(&pat_lower) || cmdline.to_lowercase().contains(&pat_lower)
+                if name_lower.contains(&pat_lower) || exe_name.to_lowercase().contains(&pat_lower) {
+                    return true;
+                }
+                let cmd = process.cmd();
+                if cmd.len() >= 2 {
+                    let first_arg = cmd[1].to_string_lossy().to_lowercase();
+                    if first_arg.contains(&pat_lower) {
+                        return true;
+                    }
+                }
+                false
             });
             if matches {
                 pids.push(*pid);
@@ -329,9 +361,16 @@ pub fn stream_json_snapshots(
         Vec::new()
     };
     let mut last_full_proc_refresh = Instant::now();
+    let mut next_tick = Instant::now();
 
     loop {
-        std::thread::sleep(interval);
+        next_tick += interval;
+        let now = Instant::now();
+        if next_tick > now {
+            std::thread::sleep(next_tick - now);
+        } else {
+            next_tick = now;
+        }
 
         sys.refresh_cpu_all();
         sys.refresh_memory();
@@ -527,6 +566,7 @@ mod tests {
     fn test_system_snapshot_serialization() {
         let snapshot = SystemSnapshot {
             timestamp_unix: 1728000000,
+            timestamp_unix_ms: 1728000000123,
             host: HostInfo {
                 board: "DFRobot ACM3576".to_string(),
                 soc: "RK3576".to_string(),
@@ -583,6 +623,7 @@ mod tests {
                 temp_celsius: Some(45),
                 power_mw: None,
                 work_mode: Some("PERFORMANCE".to_string()),
+                prefill_mode: Some("NORMAL".to_string()),
                 ddr_freq_mhz: Some(1560),
                 available_npu_freqs_mhz: vec![500, 650, 800, 850],
             }),

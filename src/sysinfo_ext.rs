@@ -408,22 +408,84 @@ pub fn get_process_threads_placement(pid: u32) -> (Vec<ThreadPlacement>, HashMap
     (threads, distribution, little_count, big_count)
 }
 
-/// Find matching processes by pattern (e.g. "rkllm", "proxy") and inspect their CPU, RSS, and thread affinity
+/// Parse /proc/[pid]/status content to determine if this PID is a secondary thread (i.e. Tgid != pid)
+pub fn parse_tgid_is_thread(status_content: &str, pid: u32) -> bool {
+    for line in status_content.lines() {
+        if line.starts_with("Tgid:") {
+            if let Some(tgid_str) = line.split_whitespace().nth(1) {
+                if let Ok(tgid) = tgid_str.parse::<u32>() {
+                    return pid != tgid;
+                }
+            }
+            break;
+        }
+    }
+    false
+}
+
+/// Check if a PID is a secondary thread (i.e. Tgid != PID in /proc/[pid]/status)
+pub fn is_secondary_thread(pid: u32) -> bool {
+    let status_path = format!("/proc/{}/status", pid);
+    if let Ok(content) = fs::read_to_string(&status_path) {
+        return parse_tgid_is_thread(&content, pid);
+    }
+    false
+}
+
+/// Find matching processes by pattern (e.g. "rkllm", "proxy") and inspect their CPU, RSS, and thread affinity.
+/// Groups threads under their main process PID and filters out wrapper commands (sudo, timeout, rktop-ai itself).
 pub fn get_tracked_processes(sys: &System, patterns: &[String]) -> Vec<ProcessAffinityProfile> {
     if patterns.is_empty() {
         return Vec::new();
     }
 
     let mut profiles = Vec::new();
+    let current_pid = std::process::id();
 
     for (pid, process) in sys.processes() {
         let pid_u32 = pid.as_u32();
+
+        // 1. Exclude self
+        if pid_u32 == current_pid {
+            continue;
+        }
+
+        // 2. Exclude secondary threads (group them under their main process instead of duplicate entries)
+        if is_secondary_thread(pid_u32) {
+            continue;
+        }
+
         let name = process.name().to_string_lossy().to_string();
+        let name_lower = name.to_lowercase();
+
+        // 3. Exclude wrapper tools that might pass the pattern as an argument
+        if name_lower == "sudo" || name_lower == "timeout" || name_lower == "rktop-ai" || name_lower == "grep" {
+            continue;
+        }
+
+        let exe_name = process
+            .exe()
+            .and_then(|p| p.file_name())
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+
         let cmdline = process.cmd().iter().map(|s| s.to_string_lossy()).collect::<Vec<_>>().join(" ");
 
         let matches = patterns.iter().any(|pat| {
             let pat_lower = pat.to_lowercase();
-            name.to_lowercase().contains(&pat_lower) || cmdline.to_lowercase().contains(&pat_lower)
+            // Check process name (comm) or executable filename
+            if name_lower.contains(&pat_lower) || exe_name.to_lowercase().contains(&pat_lower) {
+                return true;
+            }
+            // For script runners (e.g. "python3 /path/to/server.py"), check target script (argv[1])
+            let cmd = process.cmd();
+            if cmd.len() >= 2 {
+                let first_arg = cmd[1].to_string_lossy().to_lowercase();
+                if first_arg.contains(&pat_lower) {
+                    return true;
+                }
+            }
+            false
         });
 
         if matches {
@@ -484,5 +546,16 @@ mod tests {
     fn test_parse_stat_after_comm_malformed() {
         assert!(parse_stat_after_comm("invalid string without parens").is_none());
         assert!(parse_stat_after_comm("").is_none());
+    }
+
+    #[test]
+    fn test_parse_tgid_is_thread() {
+        // Main process: PID == TGID
+        let status_main = "Name:\trkllm3-server\nUmask:\t0022\nState:\tS (sleeping)\nTgid:\t27719\nNgid:\t0\nPid:\t27719\n";
+        assert!(!parse_tgid_is_thread(status_main, 27719));
+
+        // Secondary worker thread: PID != TGID
+        let status_thread = "Name:\trkllm3-server\nUmask:\t0022\nState:\tR (running)\nTgid:\t27719\nNgid:\t0\nPid:\t27899\n";
+        assert!(parse_tgid_is_thread(status_thread, 27899));
     }
 }

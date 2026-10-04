@@ -30,8 +30,21 @@ pub struct AcceleratorMetrics {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub work_mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefill_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ddr_freq_mhz: Option<u32>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub available_npu_freqs_mhz: Vec<u32>,
+}
+
+/// Static and capability details for the PCIe accelerator
+#[derive(Debug, Clone)]
+pub struct AcceleratorStaticInfo {
+    pub chip_name: String,
+    pub bus_id: String,
+    pub work_mode: Option<String>,
+    pub prefill_mode: Option<String>,
+    pub ddr_freq_mhz: Option<u32>,
     pub available_npu_freqs_mhz: Vec<u32>,
 }
 
@@ -64,9 +77,9 @@ pub fn is_accelerator_present() -> bool {
     false
 }
 
-/// Query static accelerator details (Chip Name, Bus-Id) using `rknn-smi info`.
+/// Query static accelerator details (Chip Name, Bus-Id, Modes, DDR rate) using `rknn-smi`.
 /// Note: rknn-smi info may exit with status 251 (0xFB) despite valid output.
-pub fn query_accelerator_static_info() -> Option<(String, String)> {
+pub fn query_accelerator_static_info() -> Option<AcceleratorStaticInfo> {
     let output = Command::new("/bin/rknn-smi")
         .arg("info")
         .stdout(Stdio::piped())
@@ -75,7 +88,112 @@ pub fn query_accelerator_static_info() -> Option<(String, String)> {
         .ok()?;
 
     let text = String::from_utf8_lossy(&output.stdout);
-    parse_static_info(&text)
+    let (chip_name, bus_id) = parse_static_info(&text)?;
+
+    let mut work_mode = None;
+    let mut prefill_mode = None;
+    let mut ddr_freq_mhz = None;
+    let mut available_npu_freqs_mhz = Vec::new();
+
+    parse_extended_info_text(&text, &mut work_mode, &mut prefill_mode, &mut ddr_freq_mhz, &mut available_npu_freqs_mhz);
+
+    // Try rknn-smi info -l for additional hardware info
+    if let Ok(output_l) = Command::new("/bin/rknn-smi")
+        .args(["info", "-l"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+    {
+        let text_l = String::from_utf8_lossy(&output_l.stdout);
+        parse_extended_info_text(&text_l, &mut work_mode, &mut prefill_mode, &mut ddr_freq_mhz, &mut available_npu_freqs_mhz);
+    }
+
+    // Hardware defaults for RK1828 PCIe card if not explicitly output by SMI table
+    if available_npu_freqs_mhz.is_empty() && chip_name == "RK1828" {
+        available_npu_freqs_mhz = vec![500, 666, 850, 1000];
+    }
+    if ddr_freq_mhz.is_none() && chip_name == "RK1828" {
+        ddr_freq_mhz = Some(1066);
+    }
+    if work_mode.is_none() {
+        work_mode = Some("NORMAL".to_string());
+    }
+
+    Some(AcceleratorStaticInfo {
+        chip_name,
+        bus_id,
+        work_mode,
+        prefill_mode,
+        ddr_freq_mhz,
+        available_npu_freqs_mhz,
+    })
+}
+
+/// Helper to parse work_mode, prefill_mode, DDR frequency, and available frequencies from SMI text
+pub fn parse_extended_info_text(
+    text: &str,
+    work_mode: &mut Option<String>,
+    prefill_mode: &mut Option<String>,
+    ddr_freq_mhz: &mut Option<u32>,
+    available_freqs: &mut Vec<u32>,
+) {
+    static WORK_MODE_RE: OnceLock<Regex> = OnceLock::new();
+    let wm_re = WORK_MODE_RE.get_or_init(|| {
+        Regex::new(r"(?i)\b(?:work_mode|work\s*mode|mode)\s*[:=]?\s*([A-Za-z0-9_-]+)").unwrap()
+    });
+
+    static PREFILL_RE: OnceLock<Regex> = OnceLock::new();
+    let pf_re = PREFILL_RE.get_or_init(|| {
+        Regex::new(r"(?i)\b(?:prefill_mode|prefill\s*mode|prefill)\s*[:=]?\s*([A-Za-z0-9_-]+)").unwrap()
+    });
+
+    static DDR_RE: OnceLock<Regex> = OnceLock::new();
+    let ddr_re = DDR_RE.get_or_init(|| {
+        Regex::new(r"(?i)\b(?:ddr|ddr_freq|ddr_rate)\s*[:=]?\s*(\d+)").unwrap()
+    });
+
+    static FREQ_LIST_RE: OnceLock<Regex> = OnceLock::new();
+    let freq_re = FREQ_LIST_RE.get_or_init(|| {
+        Regex::new(r"(?i)\b(?:available_freqs|frequencies|freqs)\s*[:=]?\s*\[?([0-9,\s]+)\]?").unwrap()
+    });
+
+    for line in text.lines() {
+        if work_mode.is_none() {
+            if let Some(cap) = wm_re.captures(line) {
+                let m = cap[1].to_uppercase();
+                let mode_str = match m.as_str() {
+                    "0" | "EFFICIENT" => "EFFICIENT".to_string(),
+                    "1" | "NORMAL" => "NORMAL".to_string(),
+                    "2" | "PERFORMANCE" => "PERFORMANCE".to_string(),
+                    other => other.to_string(),
+                };
+                *work_mode = Some(mode_str);
+            }
+        }
+        if prefill_mode.is_none() {
+            if let Some(cap) = pf_re.captures(line) {
+                *prefill_mode = Some(cap[1].to_uppercase());
+            }
+        }
+        if ddr_freq_mhz.is_none() {
+            if let Some(cap) = ddr_re.captures(line) {
+                if let Ok(freq) = cap[1].parse::<u32>() {
+                    *ddr_freq_mhz = Some(freq);
+                }
+            }
+        }
+        if available_freqs.is_empty() {
+            if let Some(cap) = freq_re.captures(line) {
+                let list = cap[1]
+                    .split(',')
+                    .filter_map(|s| s.trim().parse::<u32>().ok())
+                    .collect::<Vec<_>>();
+                if !list.is_empty() {
+                    *available_freqs = list;
+                }
+            }
+        }
+    }
 }
 
 /// Parse chip name and bus ID from `rknn-smi info` table output.
@@ -155,6 +273,7 @@ pub fn parse_watch_line(line: &str, chip_name: &str, bus_id: &str) -> Option<Acc
             memory_total_mb,
             health,
             work_mode: None,
+            prefill_mode: None,
             ddr_freq_mhz: None,
             available_npu_freqs_mhz: Vec::new(),
         })
@@ -220,6 +339,7 @@ fn parse_watch_line_tokens(trimmed: &str, chip_name: &str, bus_id: &str) -> Opti
             memory_total_mb: mem_total,
             health,
             work_mode: None,
+            prefill_mode: None,
             ddr_freq_mhz: None,
             available_npu_freqs_mhz: Vec::new(),
         })
@@ -258,13 +378,16 @@ impl AcceleratorMonitor {
         }
 
         // Query static info to confirm hardware responsiveness
-        let (chip_name, bus_id) = match query_accelerator_static_info() {
+        let static_info = match query_accelerator_static_info() {
             Some(info) => info,
             None => {
                 // If SMI command failed or card did not respond, disable monitor
                 return Self::disabled();
             }
         };
+
+        let chip_name = static_info.chip_name.clone();
+        let bus_id = static_info.bus_id.clone();
 
         let latest = Arc::new(RwLock::new(None));
         let running = Arc::new(AtomicBool::new(true));
@@ -273,8 +396,7 @@ impl AcceleratorMonitor {
         let latest_clone = Arc::clone(&latest);
         let running_clone = Arc::clone(&running);
         let child_pid_clone = Arc::clone(&child_pid);
-        let chip_name_worker = chip_name.clone();
-        let bus_id_worker = bus_id.clone();
+        let static_info_worker = static_info;
 
         let worker = std::thread::Builder::new()
             .name("rknn-smi-stream".to_string())
@@ -283,8 +405,7 @@ impl AcceleratorMonitor {
                     latest_clone,
                     running_clone,
                     child_pid_clone,
-                    chip_name_worker,
-                    bus_id_worker,
+                    static_info_worker,
                 );
             })
             .ok();
@@ -343,8 +464,7 @@ fn stream_worker(
     latest: Arc<RwLock<Option<AcceleratorMetrics>>>,
     running: Arc<AtomicBool>,
     child_pid: Arc<Mutex<Option<u32>>>,
-    chip_name: String,
-    bus_id: String,
+    static_info: AcceleratorStaticInfo,
 ) {
     let mut consecutive_failures: u32 = 0;
 
@@ -404,7 +524,11 @@ fn stream_worker(
             }
             match line {
                 Ok(line_str) => {
-                    if let Some(metrics) = parse_watch_line(&line_str, &chip_name, &bus_id) {
+                    if let Some(mut metrics) = parse_watch_line(&line_str, &static_info.chip_name, &static_info.bus_id) {
+                        metrics.work_mode = static_info.work_mode.clone();
+                        metrics.prefill_mode = static_info.prefill_mode.clone();
+                        metrics.ddr_freq_mhz = static_info.ddr_freq_mhz;
+                        metrics.available_npu_freqs_mhz = static_info.available_npu_freqs_mhz.clone();
                         if let Ok(mut lock) = latest.write() {
                             *lock = Some(metrics);
                         }

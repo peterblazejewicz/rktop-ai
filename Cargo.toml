@@ -1,6 +1,6 @@
 [package]
 name = "rktop-ai"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 authors = ["Alex Jokela <alex@camulus.com>", "Piotr Błażejewicz (Peter Blazejewicz) (@peterblazejewicz) <peterblazejewicz@users.noreply.github.com>"]
 license = "BSD-3-Clause"
