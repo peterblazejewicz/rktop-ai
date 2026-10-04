@@ -33,9 +33,9 @@ pub fn get_disk_total() -> Option<(u64, u64)> {
 
         // Get statvfs info
         if let Ok(stat) = nix::sys::statvfs::statvfs(mount_point) {
-            let block_size = stat.block_size() as u64;
-            let total_blocks = stat.blocks() as u64;
-            let free_blocks = stat.blocks_free() as u64;
+            let block_size = stat.block_size();
+            let total_blocks = stat.blocks();
+            let free_blocks = stat.blocks_free();
 
             total_size += block_size * total_blocks;
             total_used += block_size * (total_blocks - free_blocks);
@@ -753,13 +753,11 @@ fn find_library_path(lib_name: &str) -> Option<String> {
                 let maps_path = entry.path().join("maps");
                 if let Ok(file) = fs::File::open(&maps_path) {
                     let reader = BufReader::new(file);
-                    for line_res in reader.lines() {
-                        if let Ok(line) = line_res {
-                            if line.contains(lib_name) {
-                                if let Some(path_str) = line.split_whitespace().last() {
-                                    if path_str.starts_with('/') && Path::new(path_str).exists() {
-                                        return Some(path_str.to_string());
-                                    }
+                    for line in reader.lines().map_while(Result::ok) {
+                        if line.contains(lib_name) {
+                            if let Some(path_str) = line.split_whitespace().last() {
+                                if path_str.starts_with('/') && Path::new(path_str).exists() {
+                                    return Some(path_str.to_string());
                                 }
                             }
                         }
@@ -802,13 +800,7 @@ fn find_library_path(lib_name: &str) -> Option<String> {
         }
     }
 
-    for path in candidate_paths {
-        if Path::new(&path).exists() {
-            return Some(path);
-        }
-    }
-
-    None
+    candidate_paths.into_iter().find(|path| Path::new(path).exists())
 }
 
 /// Read librknnrt library version

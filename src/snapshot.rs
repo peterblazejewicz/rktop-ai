@@ -598,6 +598,7 @@ mod tests {
                 prefill_mode: Some("NORMAL".to_string()),
                 ddr_freq_mhz: Some(1560),
                 available_npu_freqs_mhz: vec![500, 650, 800, 850],
+                available_cpu_freqs_mhz: vec![950, 1050, 1150, 1250, 1310],
             }),
             rga: None,
             thermals_celsius: HashMap::from([

@@ -79,7 +79,7 @@ pub fn get_top_processes(sys: &System, count: usize, sort_mode: ProcessSortMode)
             minimal_processes.sort_by_key(|p| p.0);
         }
         ProcessSortMode::PidDesc => {
-            minimal_processes.sort_by(|a, b| b.0.cmp(&a.0));
+            minimal_processes.sort_by_key(|a| std::cmp::Reverse(a.0));
         }
         ProcessSortMode::NameAsc => {
             minimal_processes.sort_by(|a, b| {

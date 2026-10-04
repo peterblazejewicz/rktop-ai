@@ -35,6 +35,8 @@ pub struct AcceleratorMetrics {
     pub ddr_freq_mhz: Option<u32>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub available_npu_freqs_mhz: Vec<u32>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub available_cpu_freqs_mhz: Vec<u32>,
 }
 
 /// Static and capability details for the PCIe accelerator
@@ -46,6 +48,7 @@ pub struct AcceleratorStaticInfo {
     pub prefill_mode: Option<String>,
     pub ddr_freq_mhz: Option<u32>,
     pub available_npu_freqs_mhz: Vec<u32>,
+    pub available_cpu_freqs_mhz: Vec<u32>,
 }
 
 /// Check if a PCIe AI accelerator (RK1828 or similar) is present on the system.
@@ -113,24 +116,45 @@ pub fn parse_mode_string(text: &str) -> Option<String> {
 
 /// Parse single frequency from text (e.g. "Device 0 Chip 0: 400 MHz", "400MHz", "400 MHz", "Frequency: 400")
 /// Skips small integers (like device index 0, chip index 0) by requiring freq >= 100 MHz,
-/// or matches explicitly against MHz pattern.
+/// ignores memory capacity (MB, GB, KB) and known VRAM size (5120).
 pub fn parse_first_freq(text: &str) -> Option<u32> {
+    let lower = text.to_lowercase();
+
+    // 1. If explicit MHz pattern is present, match it directly
     static RE_MHZ: OnceLock<Regex> = OnceLock::new();
     let re_mhz = RE_MHZ.get_or_init(|| Regex::new(r"(?i)(\d+)\s*mhz").unwrap());
     if let Some(cap) = re_mhz.captures(text) {
         if let Ok(val) = cap[1].parse::<u32>() {
-            if val >= 50 {
+            if val >= 50 && val != 5120 {
                 return Some(val);
             }
         }
     }
 
+    // If text talks about MB/GB/KB/storage without any Hz frequency suffix, it is memory size, not clock rate
+    if (lower.contains("mb") || lower.contains("gb") || lower.contains("kb")) && !lower.contains("hz") {
+        return None;
+    }
+
+    // 2. Raw numbers: skip small indices (<100) and VRAM capacity (5120)
     static RE_NUM: OnceLock<Regex> = OnceLock::new();
     let re = RE_NUM.get_or_init(|| Regex::new(r"(\d+)").unwrap());
     for cap in re.captures_iter(text) {
-        if let Ok(val) = cap[1].parse::<u32>() {
-            if val >= 100 {
-                return Some(val);
+        if let Some(m) = cap.get(1) {
+            let suffix = text[m.end()..].trim_start();
+            let suffix_lower = suffix.to_lowercase();
+            if suffix_lower.starts_with("mb")
+                || suffix_lower.starts_with("gb")
+                || suffix_lower.starts_with("kb")
+                || suffix_lower.starts_with("byte")
+            {
+                continue;
+            }
+
+            if let Ok(val) = m.as_str().parse::<u32>() {
+                if val >= 100 && val != 5120 {
+                    return Some(val);
+                }
             }
         }
     }
@@ -171,8 +195,14 @@ pub fn query_accelerator_static_info() -> Option<AcceleratorStaticInfo> {
     // Query exact vendor metrics via rknn-smi info -t <target>
     let mut work_mode = query_rknn_smi_type("work_mode").and_then(|s| parse_mode_string(&s));
     let mut prefill_mode = query_rknn_smi_type("prefill_mode").and_then(|s| parse_mode_string(&s));
-    let mut ddr_freq_mhz = query_rknn_smi_type("memory").and_then(|s| parse_first_freq(&s));
+    let mut ddr_freq_mhz = query_rknn_smi_type("ddr_freq")
+        .or_else(|| query_rknn_smi_type("ddr"))
+        .or_else(|| query_rknn_smi_type("memory_freq"))
+        .and_then(|s| parse_first_freq(&s));
     let mut available_npu_freqs_mhz = query_rknn_smi_type("npu_freq")
+        .map(|s| parse_freq_list(&s))
+        .unwrap_or_default();
+    let available_cpu_freqs_mhz = query_rknn_smi_type("cpu_freq")
         .map(|s| parse_freq_list(&s))
         .unwrap_or_default();
 
@@ -197,6 +227,7 @@ pub fn query_accelerator_static_info() -> Option<AcceleratorStaticInfo> {
         prefill_mode,
         ddr_freq_mhz,
         available_npu_freqs_mhz,
+        available_cpu_freqs_mhz,
     })
 }
 
@@ -280,6 +311,7 @@ pub fn parse_watch_line(line: &str, chip_name: &str, bus_id: &str) -> Option<Acc
             prefill_mode: None,
             ddr_freq_mhz: None,
             available_npu_freqs_mhz: Vec::new(),
+            available_cpu_freqs_mhz: Vec::new(),
         })
     } else {
         // Fallback: tokenized whitespace parser for non-standard whitespace/formatting
@@ -346,6 +378,7 @@ fn parse_watch_line_tokens(trimmed: &str, chip_name: &str, bus_id: &str) -> Opti
             prefill_mode: None,
             ddr_freq_mhz: None,
             available_npu_freqs_mhz: Vec::new(),
+            available_cpu_freqs_mhz: Vec::new(),
         })
     } else {
         None
@@ -533,6 +566,7 @@ fn stream_worker(
                         metrics.prefill_mode = static_info.prefill_mode.clone();
                         metrics.ddr_freq_mhz = static_info.ddr_freq_mhz;
                         metrics.available_npu_freqs_mhz = static_info.available_npu_freqs_mhz.clone();
+                        metrics.available_cpu_freqs_mhz = static_info.available_cpu_freqs_mhz.clone();
                         if let Ok(mut lock) = latest.write() {
                             *lock = Some(metrics);
                         }
@@ -672,12 +706,16 @@ mod tests {
         assert_eq!(parse_mode_string("EFFICIENT").as_deref(), Some("EFFICIENT"));
 
         assert_eq!(parse_first_freq("400 MHz"), Some(400));
-        assert_eq!(parse_first_freq("memory: 400"), Some(400));
+        assert_eq!(parse_first_freq("ddr_freq: 400"), Some(400));
         assert_eq!(parse_first_freq("Device 0 Chip 0: 400 MHz"), Some(400));
         assert_eq!(parse_first_freq("Device 0 Chip 0: 400"), Some(400));
+        assert_eq!(parse_first_freq("Memory: 1638 / 5120 MB"), None);
+        assert_eq!(parse_first_freq("5120 MB"), None);
+        assert_eq!(parse_first_freq("5120"), None);
 
         assert_eq!(parse_freq_list("400, 500, 850"), vec![400, 500, 850]);
         assert_eq!(parse_freq_list("npu_freq: 850, 400, 500"), vec![400, 500, 850]);
         assert_eq!(parse_freq_list("Device 0: 0, 1, 400, 500, 850"), vec![400, 500, 850]);
+        assert_eq!(parse_freq_list("cpu_freq: 950, 1050, 1150, 1250, 1310"), vec![950, 1050, 1150, 1250, 1310]);
     }
 }

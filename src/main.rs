@@ -605,6 +605,13 @@ impl AppState {
     }
 }
 
+impl Default for AppState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     sys: &mut System,
@@ -1056,7 +1063,7 @@ fn render_system_panel(f: &mut Frame, area: Rect, app_state: &AppState) {
     };
 
     // Build table with two columns using cached static info
-    let row_data = vec![
+    let row_data = [
         (format!("Board: {}", app_state.board_name), format!("Host: {}", app_state.hostname)),
         (format!("SoC: {}", app_state.rk_model), format!("Kernel: {}", app_state.kernel_version)),
         (format!("NPU Driver:    {}", app_state.npu_version), format!("Arch: {}", app_state.cpu_arch)),
