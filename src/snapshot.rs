@@ -193,11 +193,26 @@ pub fn collect_snapshot(sys: &mut System, app_state: &mut AppState) -> SystemSna
     }
 }
 
+/// Write string to stdout, silently exiting with 0 on BrokenPipe (e.g. piped into head, jq failure)
+fn write_to_stdout(content: &str) {
+    use std::io::{self, Write};
+    let stdout = io::stdout();
+    let mut handle = stdout.lock();
+    if let Err(e) = handle.write_all(content.as_bytes()).and_then(|_| handle.flush()) {
+        if e.kind() == io::ErrorKind::BrokenPipe {
+            std::process::exit(0);
+        }
+        eprintln!("Error writing to stdout: {}", e);
+        std::process::exit(1);
+    }
+}
+
 /// Print formatted JSON snapshot to stdout and exit
 pub fn print_json_snapshot(sys: &mut System, app_state: &mut AppState) {
     let snapshot = collect_snapshot(sys, app_state);
-    if let Ok(json_str) = serde_json::to_string_pretty(&snapshot) {
-        println!("{}", json_str);
+    if let Ok(mut json_str) = serde_json::to_string_pretty(&snapshot) {
+        json_str.push('\n');
+        write_to_stdout(&json_str);
     } else {
         eprintln!("Error: Failed to serialize telemetry snapshot to JSON");
         std::process::exit(1);
@@ -206,15 +221,18 @@ pub fn print_json_snapshot(sys: &mut System, app_state: &mut AppState) {
 
 /// Print clean ASCII plaintext snapshot to stdout and exit
 pub fn print_oneshot_snapshot(sys: &mut System, app_state: &mut AppState) {
+    use std::fmt::Write as FmtWrite;
     let snapshot = collect_snapshot(sys, app_state);
+    let mut out = String::new();
 
-    println!("================================================================================");
-    println!(
+    let _ = writeln!(out, "================================================================================");
+    let _ = writeln!(
+        out,
         "rktop-ai System Snapshot | Host: {} | SoC: {} | Kernel: {}",
         snapshot.host.hostname, snapshot.host.soc, snapshot.host.kernel
     );
-    println!("Board: {}", snapshot.host.board);
-    println!("================================================================================");
+    let _ = writeln!(out, "Board: {}", snapshot.host.board);
+    let _ = writeln!(out, "================================================================================");
 
     // CPU
     let cores_str: Vec<String> = snapshot
@@ -223,13 +241,15 @@ pub fn print_oneshot_snapshot(sys: &mut System, app_state: &mut AppState) {
         .iter()
         .map(|p| format!("{:.0}%", p))
         .collect();
-    println!(
+    let _ = writeln!(
+        out,
         "CPU:       {:.1}% ({} cores: {})",
         snapshot.cpu.total_load_pct,
         snapshot.cpu.per_core_pct.len(),
         cores_str.join(" ")
     );
-    println!(
+    let _ = writeln!(
+        out,
         "           User: {:.1}%  System: {:.1}%  IOWait: {:.1}%  Idle: {:.1}%",
         snapshot.cpu.user_pct, snapshot.cpu.system_pct, snapshot.cpu.iowait_pct, snapshot.cpu.idle_pct
     );
@@ -242,7 +262,8 @@ pub fn print_oneshot_snapshot(sys: &mut System, app_state: &mut AppState) {
     } else {
         0.0
     };
-    println!(
+    let _ = writeln!(
+        out,
         "RAM:       {:.1} GB / {:.1} GB ({:.1}%)",
         ram_used_gb, ram_total_gb, ram_pct
     );
@@ -250,7 +271,7 @@ pub fn print_oneshot_snapshot(sys: &mut System, app_state: &mut AppState) {
     // GPU
     if let Some(gpu) = snapshot.gpu {
         let freq_str = gpu.freq_mhz.map(|f| format!(" @ {} MHz", f)).unwrap_or_default();
-        println!("GPU:       Mali {:.2}%{}", gpu.usage_pct, freq_str);
+        let _ = writeln!(out, "GPU:       Mali {:.2}%{}", gpu.usage_pct, freq_str);
     }
 
     // Host NPU
@@ -262,21 +283,24 @@ pub fn print_oneshot_snapshot(sys: &mut System, app_state: &mut AppState) {
             .enumerate()
             .map(|(i, &p)| format!("Core {}: {}%", i, p))
             .collect();
-        println!("Host NPU:  {}{}", cores.join(" | "), freq_str);
+        let _ = writeln!(out, "Host NPU:  {}{}", cores.join(" | "), freq_str);
     }
 
     // PCIe AI Accelerator
     if let Some(acc) = snapshot.accelerator {
-        println!("--------------------------------------------------------------------------------");
-        println!(
+        let _ = writeln!(out, "--------------------------------------------------------------------------------");
+        let _ = writeln!(
+            out,
             "AI Card:   {} (PCIe: {}) - Status: {}",
             acc.chip_name, acc.bus_id, acc.health
         );
-        println!(
+        let _ = writeln!(
+            out,
             "           NPU:  {:>3}% @ {} MHz",
             acc.npu_load_pct, acc.npu_freq_mhz
         );
-        println!(
+        let _ = writeln!(
+            out,
             "           VRAM: {:>4} / {:>4} MB ({:.1}%)",
             acc.memory_used_mb,
             acc.memory_total_mb,
@@ -286,28 +310,30 @@ pub fn print_oneshot_snapshot(sys: &mut System, app_state: &mut AppState) {
                 0.0
             }
         );
-        println!(
+        let _ = writeln!(
+            out,
             "           CPU:  {:>3}% @ {} MHz",
             acc.cpu_load_pct, acc.cpu_freq_mhz
         );
         let temp_str = acc.temp_celsius.map(|t| format!("{}°C", t)).unwrap_or_else(|| "N/A".to_string());
         let power_str = acc.power_mw.map(|p| format!("{:.2}W", p as f64 / 1000.0)).unwrap_or_else(|| "N/A".to_string());
-        println!("           Temp: {} | Power: {}", temp_str, power_str);
+        let _ = writeln!(out, "           Temp: {} | Power: {}", temp_str, power_str);
     }
 
     // Thermals
     if !snapshot.thermals_celsius.is_empty() {
-        println!("--------------------------------------------------------------------------------");
+        let _ = writeln!(out, "--------------------------------------------------------------------------------");
         let mut sorted_thermals: Vec<(&String, &i32)> = snapshot.thermals_celsius.iter().collect();
         sorted_thermals.sort_by_key(|(k, _)| (*k).clone());
         let thermals_str: Vec<String> = sorted_thermals
             .iter()
             .map(|(name, temp)| format!("{}: {}°C", name, temp))
             .collect();
-        println!("Thermals:  {}", thermals_str.join("  "));
+        let _ = writeln!(out, "Thermals:  {}", thermals_str.join("  "));
     }
 
-    println!("================================================================================");
+    let _ = writeln!(out, "================================================================================");
+    write_to_stdout(&out);
 }
 
 #[cfg(test)]

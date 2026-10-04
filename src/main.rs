@@ -83,6 +83,16 @@ fn print_help() {
 }
 
 fn main() -> Result<()> {
+    // Install a panic hook to handle BrokenPipe quietly (e.g. piped into head or downstream process fails)
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        let msg = panic_info.to_string();
+        if msg.contains("Broken pipe") {
+            std::process::exit(0);
+        }
+        default_hook(panic_info);
+    }));
+
     let args: Vec<String> = std::env::args().collect();
 
     for arg in args.iter().skip(1) {
