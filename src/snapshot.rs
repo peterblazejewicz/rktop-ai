@@ -1,15 +1,24 @@
 use serde::Serialize;
 use std::collections::HashMap;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sysinfo::System;
 
 use crate::accelerator::AcceleratorMetrics;
 use crate::hardware::{
-    get_gpu_frequency, get_gpu_usage, get_npu_frequency, get_npu_load, get_rga_load,
-    get_thermal_cached,
+    get_dmc_available_frequencies, get_dmc_available_governors, get_dmc_frequency,
+    get_dmc_governor, get_gpu_frequency, get_gpu_usage, get_npu_frequency, get_npu_load,
+    get_rga_load, get_thermal_cached,
 };
-use crate::sysinfo_ext::{get_zram_info, ZramInfo};
+use crate::sysinfo_ext::{get_tracked_processes, get_zram_info, ProcessAffinityProfile, ZramInfo};
 use crate::AppState;
+
+#[derive(Serialize)]
+pub struct DmcSnapshot {
+    pub freq_mhz: u32,
+    pub governor: String,
+    pub available_frequencies_mhz: Vec<u32>,
+    pub available_governors: Vec<String>,
+}
 
 #[derive(Serialize)]
 pub struct SystemSnapshot {
@@ -17,12 +26,15 @@ pub struct SystemSnapshot {
     pub host: HostInfo,
     pub cpu: CpuSnapshot,
     pub memory: MemorySnapshot,
+    pub dmc: Option<DmcSnapshot>,
     pub gpu: Option<GpuSnapshot>,
     pub host_npu: Option<NpuSnapshot>,
     pub accelerator: Option<AcceleratorMetrics>,
     pub rga: Option<HashMap<String, f32>>,
     pub thermals_celsius: HashMap<String, i32>,
     pub stats: StatsSnapshot,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tracked_processes: Option<Vec<ProcessAffinityProfile>>,
 }
 
 #[derive(Serialize)]
@@ -82,12 +94,19 @@ pub struct StatsSnapshot {
 }
 
 /// Collect a complete snapshot of all host and accelerator metrics
-pub fn collect_snapshot(sys: &mut System, app_state: &mut AppState) -> SystemSnapshot {
+pub fn collect_snapshot(
+    sys: &mut System,
+    app_state: &mut AppState,
+    tracked_patterns: &[String],
+) -> SystemSnapshot {
     // Refresh CPU stats with two measurements to compute accurate usage
     sys.refresh_cpu_all();
     std::thread::sleep(Duration::from_millis(250));
     sys.refresh_cpu_all();
     sys.refresh_memory();
+    if !tracked_patterns.is_empty() {
+        sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    }
 
     app_state.update_cpu_stats();
     app_state.update_stats();
@@ -104,6 +123,23 @@ pub fn collect_snapshot(sys: &mut System, app_state: &mut AppState) -> SystemSna
         }
     }
 
+    build_snapshot_internal(sys, app_state, tracked_patterns)
+}
+
+/// Fast snapshot builder without sleep (used by continuous streaming loop)
+pub fn collect_snapshot_continuous(
+    sys: &System,
+    app_state: &AppState,
+    tracked_patterns: &[String],
+) -> SystemSnapshot {
+    build_snapshot_internal(sys, app_state, tracked_patterns)
+}
+
+fn build_snapshot_internal(
+    sys: &System,
+    app_state: &AppState,
+    tracked_patterns: &[String],
+) -> SystemSnapshot {
     let timestamp_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -148,6 +184,13 @@ pub fn collect_snapshot(sys: &mut System, app_state: &mut AppState) -> SystemSna
         zram: get_zram_info(),
     };
 
+    let dmc = get_dmc_frequency().map(|freq_mhz| DmcSnapshot {
+        freq_mhz,
+        governor: get_dmc_governor().unwrap_or_else(|| "unknown".to_string()),
+        available_frequencies_mhz: get_dmc_available_frequencies(),
+        available_governors: get_dmc_available_governors(),
+    });
+
     let gpu = get_gpu_usage().map(|usage_pct| GpuSnapshot {
         usage_pct,
         freq_mhz: get_gpu_frequency(),
@@ -183,17 +226,30 @@ pub fn collect_snapshot(sys: &mut System, app_state: &mut AppState) -> SystemSna
         blocked_processes: app_state.blocked_procs,
     };
 
+    let tracked_processes = if !tracked_patterns.is_empty() {
+        let list = get_tracked_processes(sys, tracked_patterns);
+        if !list.is_empty() {
+            Some(list)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     SystemSnapshot {
         timestamp_unix,
         host,
         cpu,
         memory,
+        dmc,
         gpu,
         host_npu,
         accelerator,
         rga,
         thermals_celsius,
         stats,
+        tracked_processes,
     }
 }
 
@@ -212,8 +268,8 @@ fn write_to_stdout(content: &str) {
 }
 
 /// Print formatted JSON snapshot to stdout and exit
-pub fn print_json_snapshot(sys: &mut System, app_state: &mut AppState) {
-    let snapshot = collect_snapshot(sys, app_state);
+pub fn print_json_snapshot(sys: &mut System, app_state: &mut AppState, tracked_patterns: &[String]) {
+    let snapshot = collect_snapshot(sys, app_state, tracked_patterns);
     if let Ok(mut json_str) = serde_json::to_string_pretty(&snapshot) {
         json_str.push('\n');
         write_to_stdout(&json_str);
@@ -223,10 +279,88 @@ pub fn print_json_snapshot(sys: &mut System, app_state: &mut AppState) {
     }
 }
 
+/// Stream continuous JSON snapshots at specified interval (NDJSON, sub-second capable)
+pub fn stream_json_snapshots(
+    sys: &mut System,
+    app_state: &mut AppState,
+    interval: Duration,
+    tracked_patterns: &[String],
+) {
+    // Initial measurement
+    sys.refresh_cpu_all();
+    sys.refresh_memory();
+    if !tracked_patterns.is_empty() {
+        sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    }
+    app_state.update_cpu_stats();
+    app_state.update_stats();
+
+    // Give accelerator monitor time to collect initial line
+    if let Some(ref monitor) = app_state.accelerator {
+        if monitor.is_available() && monitor.get_metrics().is_none() {
+            for _ in 0..10 {
+                std::thread::sleep(Duration::from_millis(50));
+                if monitor.get_metrics().is_some() {
+                    break;
+                }
+            }
+        }
+    }
+
+    let find_pids = |system: &System| -> Vec<sysinfo::Pid> {
+        let mut pids = Vec::new();
+        for (pid, process) in system.processes() {
+            let name = process.name().to_string_lossy();
+            let cmdline = process.cmd().iter().map(|s| s.to_string_lossy()).collect::<Vec<_>>().join(" ");
+            let matches = tracked_patterns.iter().any(|pat| {
+                let pat_lower = pat.to_lowercase();
+                name.to_lowercase().contains(&pat_lower) || cmdline.to_lowercase().contains(&pat_lower)
+            });
+            if matches {
+                pids.push(*pid);
+            }
+        }
+        pids
+    };
+
+    let mut tracked_pids = if !tracked_patterns.is_empty() {
+        find_pids(sys)
+    } else {
+        Vec::new()
+    };
+    let mut last_full_proc_refresh = Instant::now();
+
+    loop {
+        std::thread::sleep(interval);
+
+        sys.refresh_cpu_all();
+        sys.refresh_memory();
+        if !tracked_patterns.is_empty() {
+            // Full process scan every 2 seconds to discover newly spawned processes without CPU spikes.
+            // On sub-second ticks, refresh ONLY the specific tracked PIDs.
+            if last_full_proc_refresh.elapsed() >= Duration::from_secs(2) || tracked_pids.is_empty() {
+                sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+                tracked_pids = find_pids(sys);
+                last_full_proc_refresh = Instant::now();
+            } else {
+                sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&tracked_pids), true);
+            }
+        }
+        app_state.update_cpu_stats();
+        app_state.update_stats();
+
+        let snapshot = collect_snapshot_continuous(sys, app_state, tracked_patterns);
+        if let Ok(mut json_str) = serde_json::to_string(&snapshot) {
+            json_str.push('\n');
+            write_to_stdout(&json_str);
+        }
+    }
+}
+
 /// Print clean ASCII plaintext snapshot to stdout and exit
-pub fn print_oneshot_snapshot(sys: &mut System, app_state: &mut AppState) {
+pub fn print_oneshot_snapshot(sys: &mut System, app_state: &mut AppState, tracked_patterns: &[String]) {
     use std::fmt::Write as FmtWrite;
-    let snapshot = collect_snapshot(sys, app_state);
+    let snapshot = collect_snapshot(sys, app_state, tracked_patterns);
     let mut out = String::new();
 
     let _ = writeln!(out, "================================================================================");
@@ -271,6 +405,16 @@ pub fn print_oneshot_snapshot(sys: &mut System, app_state: &mut AppState) {
         "RAM:       {:.1} GB / {:.1} GB ({:.1}%)",
         ram_used_gb, ram_total_gb, ram_pct
     );
+
+    // DMC (Host DDR)
+    if let Some(ref dmc) = snapshot.dmc {
+        let mut dmc_str = format!("{} MHz (governor: {})", dmc.freq_mhz, dmc.governor);
+        if !dmc.available_frequencies_mhz.is_empty() {
+            let freqs: Vec<String> = dmc.available_frequencies_mhz.iter().map(|f| f.to_string()).collect();
+            dmc_str.push_str(&format!(" [available: {} MHz]", freqs.join(", ")));
+        }
+        let _ = writeln!(out, "DMC (DDR): {}", dmc_str);
+    }
 
     // GPU
     if let Some(gpu) = snapshot.gpu {
@@ -336,6 +480,41 @@ pub fn print_oneshot_snapshot(sys: &mut System, app_state: &mut AppState) {
         let _ = writeln!(out, "Thermals:  {}", thermals_str.join("  "));
     }
 
+    // Tracked Processes & Thread Core Placement
+    if let Some(ref procs) = snapshot.tracked_processes {
+        let _ = writeln!(out, "--------------------------------------------------------------------------------");
+        let _ = writeln!(out, "Tracked Processes & Thread-to-Core Placement:");
+        for p in procs {
+            let _ = writeln!(
+                out,
+                "  [PID {:>5}] {:<18} | CPU: {:>5.1}% | RSS: {:>4} MB | Threads: {}",
+                p.pid, p.name, p.cpu_pct, p.rss_mb, p.thread_count
+            );
+            let mut dist_str = Vec::new();
+            for core_id in 0..8 {
+                let key = format!("core{}", core_id);
+                if let Some(&cnt) = p.core_distribution.get(&key) {
+                    if cnt > 0 {
+                        dist_str.push(format!("{}: {}", key, cnt));
+                    }
+                }
+            }
+            let _ = writeln!(
+                out,
+                "             Cores: A72 (big): {} | A53 (little): {} [{}]",
+                p.big_cores_count, p.little_cores_count, dist_str.join(", ")
+            );
+            if !p.threads.is_empty() && p.threads.len() <= 16 {
+                let th_strs: Vec<String> = p
+                    .threads
+                    .iter()
+                    .map(|t| format!("TID {} ({}) -> Core {}", t.tid, t.name, t.cpu_core))
+                    .collect();
+                let _ = writeln!(out, "             {}", th_strs.join(" | "));
+            }
+        }
+    }
+
     let _ = writeln!(out, "================================================================================");
     write_to_stdout(&out);
 }
@@ -376,6 +555,12 @@ mod tests {
                 swap_used_bytes: 0,
                 zram: None,
             },
+            dmc: Some(DmcSnapshot {
+                freq_mhz: 1560,
+                governor: "performance".to_string(),
+                available_frequencies_mhz: vec![528, 1066, 1560, 2112],
+                available_governors: vec!["performance".to_string(), "dmc_ondemand".to_string()],
+            }),
             gpu: Some(GpuSnapshot {
                 usage_pct: 0.0,
                 freq_mhz: Some(300),
@@ -397,6 +582,9 @@ mod tests {
                 cpu_freq_mhz: 1000,
                 temp_celsius: Some(45),
                 power_mw: None,
+                work_mode: Some("PERFORMANCE".to_string()),
+                ddr_freq_mhz: Some(1560),
+                available_npu_freqs_mhz: vec![500, 650, 800, 850],
             }),
             rga: None,
             thermals_celsius: HashMap::from([
@@ -411,6 +599,7 @@ mod tests {
                 running_processes: 2,
                 blocked_processes: 0,
             },
+            tracked_processes: None,
         };
 
         let json = serde_json::to_string(&snapshot).expect("JSON serialization failed");
@@ -423,5 +612,42 @@ mod tests {
         assert_eq!(val["host"]["soc"], "RK3576");
         assert_eq!(val["accelerator"]["chip_name"], "RK1828");
         assert_eq!(val["cpu"]["total_load_pct"], 12.5);
+        assert_eq!(val["dmc"]["freq_mhz"], 1560);
+        assert_eq!(val["dmc"]["governor"], "performance");
+    }
+
+    #[test]
+    fn test_tracked_processes_serialization() {
+        use crate::sysinfo_ext::ThreadPlacement;
+
+        let profile = ProcessAffinityProfile {
+            pid: 1234,
+            name: "rkllm3-server".to_string(),
+            cmdline: "/usr/bin/rkllm3-server --threads 4".to_string(),
+            cpu_pct: 98.5,
+            rss_bytes: 1939865600,
+            rss_mb: 1850,
+            thread_count: 4,
+            little_cores_count: 0,
+            big_cores_count: 4,
+            core_distribution: HashMap::from([
+                ("core4".to_string(), 1),
+                ("core5".to_string(), 1),
+                ("core6".to_string(), 1),
+                ("core7".to_string(), 1),
+            ]),
+            threads: vec![
+                ThreadPlacement { tid: 1234, name: "rkllm3-server".to_string(), cpu_core: 4 },
+                ThreadPlacement { tid: 1235, name: "worker-0".to_string(), cpu_core: 5 },
+                ThreadPlacement { tid: 1236, name: "worker-1".to_string(), cpu_core: 6 },
+                ThreadPlacement { tid: 1237, name: "worker-2".to_string(), cpu_core: 7 },
+            ],
+        };
+
+        let json = serde_json::to_string(&profile).expect("Serialization failed");
+        assert!(json.contains("\"name\":\"rkllm3-server\""));
+        assert!(json.contains("\"big_cores_count\":4"));
+        assert!(json.contains("\"little_cores_count\":0"));
+        assert!(json.contains("\"cpu_core\":7"));
     }
 }

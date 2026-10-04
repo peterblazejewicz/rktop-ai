@@ -128,15 +128,24 @@ pub fn get_top_processes(sys: &System, count: usize, sort_mode: ProcessSortMode)
         .collect()
 }
 
+/// Helper to extract fields after the command name from /proc/[pid]/stat content.
+/// The command name in field 2 is enclosed in parentheses and may contain spaces or parentheses.
+/// Returns the remaining whitespace-separated fields starting at field 3 (state).
+pub fn parse_stat_after_comm(stat_content: &str) -> Option<Vec<&str>> {
+    let rparen = stat_content.rfind(')')?;
+    let rest = &stat_content[rparen + 1..];
+    Some(rest.split_whitespace().collect())
+}
+
 fn get_process_nice(pid: u32) -> i32 {
-    // Read nice level from /proc/<pid>/stat
+    // Read nice level from /proc/<pid>/stat (field 19 -> index 16 after comm)
     let stat_path = format!("/proc/{}/stat", pid);
     if let Ok(content) = fs::read_to_string(&stat_path) {
-        // The nice value is the 19th field in /proc/pid/stat
-        let fields: Vec<&str> = content.split_whitespace().collect();
-        if fields.len() >= 19 {
-            if let Ok(nice) = fields[18].parse::<i32>() {
-                return nice;
+        if let Some(fields) = parse_stat_after_comm(&content) {
+            if fields.len() > 16 {
+                if let Ok(nice) = fields[16].parse::<i32>() {
+                    return nice;
+                }
             }
         }
     }
@@ -144,14 +153,14 @@ fn get_process_nice(pid: u32) -> i32 {
 }
 
 fn get_process_cpu_core(pid: u32) -> u32 {
-    // Read current CPU core from /proc/<pid>/stat
+    // Read current CPU core from /proc/<pid>/stat (field 39 -> index 36 after comm)
     let stat_path = format!("/proc/{}/stat", pid);
     if let Ok(content) = fs::read_to_string(&stat_path) {
-        // The processor (CPU core) is the 39th field in /proc/pid/stat
-        let fields: Vec<&str> = content.split_whitespace().collect();
-        if fields.len() >= 39 {
-            if let Ok(cpu_core) = fields[38].parse::<u32>() {
-                return cpu_core;
+        if let Some(fields) = parse_stat_after_comm(&content) {
+            if fields.len() > 36 {
+                if let Ok(cpu_core) = fields[36].parse::<u32>() {
+                    return cpu_core;
+                }
             }
         }
     }
@@ -191,10 +200,8 @@ fn get_process_extended_info(pid: u32) -> (u32, bool, u32, char, u32) {
     // Read /proc/[pid]/stat once for state
     let stat_path = format!("/proc/{}/stat", pid);
     if let Ok(content) = fs::read_to_string(&stat_path) {
-        // State is the field after the command name (which is in parentheses)
-        if let Some(paren_end) = content.rfind(')') {
-            let after_name = &content[paren_end + 1..];
-            if let Some(state_char) = after_name.trim().chars().next() {
+        if let Some(fields) = parse_stat_after_comm(&content) {
+            if let Some(state_char) = fields.first().and_then(|s| s.chars().next()) {
                 state = state_char;
             }
         }
@@ -212,8 +219,8 @@ fn get_process_user(process: &Process) -> String {
     if let Some(uid) = process.user_id() {
         let uid_num = uid.to_string().parse::<u32>().unwrap_or(0);
 
-        // Try to get from cache first
-        let mut cache = USER_CACHE.lock().unwrap();
+        // Try to get from cache first (safely recovering if lock was poisoned)
+        let mut cache = USER_CACHE.lock().unwrap_or_else(|e| e.into_inner());
         if cache.is_none() {
             *cache = Some(HashMap::new());
         }
@@ -325,4 +332,157 @@ pub fn get_cpu_stats() -> CpuStats {
     }
 
     stats
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ThreadPlacement {
+    pub tid: u32,
+    pub name: String,
+    pub cpu_core: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProcessAffinityProfile {
+    pub pid: u32,
+    pub name: String,
+    pub cmdline: String,
+    pub cpu_pct: f32,
+    pub rss_bytes: u64,
+    pub rss_mb: u64,
+    pub thread_count: usize,
+    pub little_cores_count: usize, // Cores 0-3 (e.g. Cortex-A53)
+    pub big_cores_count: usize,    // Cores 4-7 (e.g. Cortex-A72 / A76)
+    pub core_distribution: HashMap<String, usize>,
+    pub threads: Vec<ThreadPlacement>,
+}
+
+/// Read thread-level placement and affinity for a specific PID
+pub fn get_process_threads_placement(pid: u32) -> (Vec<ThreadPlacement>, HashMap<String, usize>, usize, usize) {
+    let mut threads = Vec::new();
+    let mut distribution = HashMap::new();
+    let mut little_count = 0;
+    let mut big_count = 0;
+
+    let task_dir = format!("/proc/{}/task", pid);
+    if let Ok(entries) = fs::read_dir(task_dir) {
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let tid_str = file_name.to_string_lossy();
+            if let Ok(tid) = tid_str.parse::<u32>() {
+                let comm_path = entry.path().join("comm");
+                let name = fs::read_to_string(&comm_path)
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_else(|_| "unknown".to_string());
+
+                let stat_path = entry.path().join("stat");
+                let mut cpu_core = 0;
+                if let Ok(stat_content) = fs::read_to_string(&stat_path) {
+                    if let Some(fields) = parse_stat_after_comm(&stat_content) {
+                        if fields.len() > 36 {
+                            if let Ok(core) = fields[36].parse::<u32>() {
+                                cpu_core = core;
+                            }
+                        }
+                    }
+                }
+
+                if cpu_core < 4 {
+                    little_count += 1;
+                } else {
+                    big_count += 1;
+                }
+
+                let core_key = format!("core{}", cpu_core);
+                *distribution.entry(core_key).or_insert(0) += 1;
+
+                threads.push(ThreadPlacement {
+                    tid,
+                    name,
+                    cpu_core,
+                });
+            }
+        }
+    }
+
+    threads.sort_by_key(|t| t.tid);
+    (threads, distribution, little_count, big_count)
+}
+
+/// Find matching processes by pattern (e.g. "rkllm", "proxy") and inspect their CPU, RSS, and thread affinity
+pub fn get_tracked_processes(sys: &System, patterns: &[String]) -> Vec<ProcessAffinityProfile> {
+    if patterns.is_empty() {
+        return Vec::new();
+    }
+
+    let mut profiles = Vec::new();
+
+    for (pid, process) in sys.processes() {
+        let pid_u32 = pid.as_u32();
+        let name = process.name().to_string_lossy().to_string();
+        let cmdline = process.cmd().iter().map(|s| s.to_string_lossy()).collect::<Vec<_>>().join(" ");
+
+        let matches = patterns.iter().any(|pat| {
+            let pat_lower = pat.to_lowercase();
+            name.to_lowercase().contains(&pat_lower) || cmdline.to_lowercase().contains(&pat_lower)
+        });
+
+        if matches {
+            let (threads, core_distribution, little_cores_count, big_cores_count) =
+                get_process_threads_placement(pid_u32);
+            let thread_count = if !threads.is_empty() { threads.len() } else { 1 };
+            let rss_bytes = process.memory();
+            let rss_mb = rss_bytes / (1024 * 1024);
+
+            profiles.push(ProcessAffinityProfile {
+                pid: pid_u32,
+                name,
+                cmdline,
+                cpu_pct: process.cpu_usage(),
+                rss_bytes,
+                rss_mb,
+                thread_count,
+                little_cores_count,
+                big_cores_count,
+                core_distribution,
+                threads,
+            });
+        }
+    }
+
+    profiles.sort_by(|a, b| b.cpu_pct.partial_cmp(&a.cpu_pct).unwrap_or(std::cmp::Ordering::Equal));
+    profiles
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_stat_after_comm_standard() {
+        // Standard /proc/pid/stat: pid comm(no space) state ppid ...
+        // Index 0: state ('S')
+        // Index 16: nice (field 19)
+        // Index 36: processor (field 39)
+        let sample = "12345 (bash) S 1234 12345 12345 34816 12345 4194304 382 0 0 0 2 1 0 0 20 0 1 0 123456 1234567 123 18446744073709551615 0 0 0 0 0 0 0 2147483647 0 0 0 0 17 6 0 0 0 0 0 0 0 0 0 0 0 0 0";
+        let fields = parse_stat_after_comm(sample).expect("should parse");
+        assert_eq!(fields[0], "S"); // state
+        assert_eq!(fields[16], "0"); // nice (field 19)
+        assert_eq!(fields[36], "6"); // processor (field 39) -> core 6
+    }
+
+    #[test]
+    fn test_parse_stat_after_comm_with_spaces_and_nested_parens() {
+        // Process name with spaces and nested parentheses: (rkllm (worker) 0)
+        let sample = "8812 (rkllm (worker) 0) R 8800 8812 8812 0 -1 4194304 50 0 0 0 150 20 0 0 10 -5 4 0 50000 90000 500 18446744073709551615 0 0 0 0 0 0 0 2147483647 0 0 0 0 17 5 0 0 0 0 0 0 0 0 0 0 0 0 0";
+        let fields = parse_stat_after_comm(sample).expect("should parse");
+        assert_eq!(fields[0], "R"); // state is Running
+        assert_eq!(fields[16], "-5"); // nice is -5
+        assert_eq!(fields[36], "5"); // processor is core 5 (big core)
+    }
+
+    #[test]
+    fn test_parse_stat_after_comm_malformed() {
+        assert!(parse_stat_after_comm("invalid string without parens").is_none());
+        assert!(parse_stat_after_comm("").is_none());
+    }
 }

@@ -27,6 +27,12 @@ pub struct AcceleratorMetrics {
     pub memory_used_mb: u64,
     pub memory_total_mb: u64,
     pub health: String,          // e.g. "OK"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub work_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ddr_freq_mhz: Option<u32>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub available_npu_freqs_mhz: Vec<u32>,
 }
 
 /// Check if a PCIe AI accelerator (RK1828 or similar) is present on the system.
@@ -148,6 +154,9 @@ pub fn parse_watch_line(line: &str, chip_name: &str, bus_id: &str) -> Option<Acc
             memory_used_mb,
             memory_total_mb,
             health,
+            work_mode: None,
+            ddr_freq_mhz: None,
+            available_npu_freqs_mhz: Vec::new(),
         })
     } else {
         // Fallback: tokenized whitespace parser for non-standard whitespace/formatting
@@ -210,6 +219,9 @@ fn parse_watch_line_tokens(trimmed: &str, chip_name: &str, bus_id: &str) -> Opti
             memory_used_mb,
             memory_total_mb: mem_total,
             health,
+            work_mode: None,
+            ddr_freq_mhz: None,
+            available_npu_freqs_mhz: Vec::new(),
         })
     } else {
         None

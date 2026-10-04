@@ -21,28 +21,31 @@ A high-performance system monitoring tool for Rockchip SoC devices (RK3576, RK35
 - **CPU**: Per-core usage, frequencies, and time breakdown (user/system/iowait/idle)
 - **GPU (Mali)**: Utilization percentage and frequency via Panthor or Bifrost devfreq/debugfs
 - **Host NPU (RKNPU2)**: Per-core load (0–2 cores on RK3576, 0–3 cores on RK3588) and dynamic frequency
+- **Host DDR / DMC (Dynamic Memory Controller)**: Current frequency, active governor, available frequencies, and governors via devfreq
 - **PCIe AI Accelerator (RK1828 / RM1828MC0-F)**:
   - Real-time NPU utilization percentage, clock frequency, and sparkline history
   - Dedicated onboard VRAM gauge (e.g. `1600 MB / 5120 MB` LPDDR)
   - Coprocessor CPU load and operating frequency
+  - Work mode, DDR frequency, and available NPU frequencies
   - Board temperature, power consumption (mW), PCIe bus ID (`0000:01:00.0`), and card health
 - **RGA**: 2D graphics accelerator scheduler load across all RGA cores
 - **Memory**: RAM, Swap, and ZRAM usage with compression ratio and breakdown
 - **Temperatures**: Thermal sensors for CPU, GPU, NPU, and ambient zones
 - **Network & Disk I/O**: Real-time throughput rates per network adapter and storage device
 
-### Process Information
+### Process & Thread Affinity Profiling
 - **Interactive Sorting**: Sort by CPU, Memory, PID, or Name (ascending/descending)
 - **Detailed Metrics**: PID, User, Nice level, CPU core affinity, Runtime, CPU%, Memory%
+- **Named Process Tracking (`--proc`)**: Inspect specific AI engines (e.g. `rkllm3-server`, `proxy`) with thread-to-core affinity distribution across Little Cortex-A53 cores (0–3) vs Big Cortex-A72 cores (4–7)
 - **Dynamic Display**: Adaptive layout fitting any terminal dimensions
 
 ### System Statistics & Version Probing
 - System uptime, hostname, kernel release, and load average (1/5/15 min)
-- CPU governor and frequency ranges (per cluster)
+- CPU and DDR governors and frequency ranges (per cluster)
 - Context switches, interrupts, and softirqs per second
 - Active TCP connection count
 - NPU and RGA kernel driver versions
-- Host RKNN and RKLLM runtime library versions
+- Dynamic detection of Host RKNN and RKLLM runtime library versions (`/proc/*/maps`, `LD_LIBRARY_PATH`, filesystem)
 - Dedicated AI Accelerator model and PCIe bus address
 
 ---
@@ -133,6 +136,9 @@ sudo rktop-ai
 |:---|:---:|:---|
 | `--json` | `-j` | Output a complete structured JSON telemetry snapshot to stdout and exit |
 | `--oneshot` | `-1` | Print a clean, formatted ASCII text summary to stdout and exit |
+| `--stream [MS]` | `-s` | Continuously stream NDJSON snapshots at sub-second interval (default: 500ms, e.g. `-s 200`) |
+| `--watch [SECS]` | `-w` | Continuously stream NDJSON snapshots at second intervals (e.g. `-w 1`) |
+| `--proc <names>` | `-p` | Filter & profile named processes and thread CPU core placement (comma-separated, e.g. `-p rkllm,proxy`) |
 | `--help` | `-h` | Display usage instructions and CLI options |
 | `--version` | `-v` | Display version information |
 
@@ -140,7 +146,7 @@ sudo rktop-ai
 
 ## Agentic AI Workflow Integration
 
-When running AI coding assistants (such as **Claude Code**) or autonomous agents directly on Rockchip embedded platforms, TUI interfaces cannot be easily consumed. `rktop-ai` provides structured telemetry snapshots so agents can inspect hardware utilization, detect thermal throttling, and verify model offloading in real time:
+When running AI coding assistants (such as **Claude Code**) or autonomous agents directly on Rockchip embedded platforms, TUI interfaces cannot be easily consumed. `rktop-ai` provides structured telemetry snapshots and continuous NDJSON streaming so agents can inspect hardware utilization, detect thermal throttling, verify model offloading, and profile thread core placement in real time:
 
 ```bash
 # Full system telemetry in JSON format
@@ -164,12 +170,21 @@ sudo rktop-ai --json | jq .accelerator
 #   "power_mw": null
 # }
 
-# Inspect Host RKNPU2 core load & frequency
-sudo rktop-ai --json | jq .host_npu
+# Inspect Host DDR (DMC) frequency and active governor
+sudo rktop-ai --json | jq .dmc
+# Output:
+# {
+#   "freq_mhz": 1056,
+#   "governor": "dmc_ondemand",
+#   "available_frequencies_mhz": [328, 528, 784, 1056],
+#   "available_governors": ["dmc_ondemand", "userspace", "powersave", "performance"]
+# }
 
-# Script-friendly VRAM and load queries
-VRAM_USED=$(sudo rktop-ai --json | jq -r '.accelerator.memory_used_mb')
-echo "PCIe Accelerator VRAM: ${VRAM_USED} MB"
+# Profile specific AI processes and inspect thread affinity on Big vs Little cores
+sudo rktop-ai --json --proc rkllm3-server,proxy | jq '.tracked_processes[] | {name, cpu_pct, rss_mb, thread_count, little_cores_count, big_cores_count}'
+
+# Sub-second continuous streaming (NDJSON) to resolve rapid LLM prefill phases (e.g. every 200ms)
+sudo rktop-ai --stream 200 --proc rkllm3-server | jq -c '{time: .timestamp_unix, npu: .accelerator.npu_load_pct, rkllm_cpu: .tracked_processes[0].cpu_pct}'
 
 # Human-readable one-shot diagnostic print
 sudo rktop-ai --oneshot

@@ -26,7 +26,7 @@ mod snapshot;
 use hardware::*;
 use sysinfo_ext::*;
 use accelerator::*;
-use snapshot::{print_json_snapshot, print_oneshot_snapshot};
+use snapshot::{print_json_snapshot, print_oneshot_snapshot, stream_json_snapshots};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ProcessSortMode {
@@ -68,18 +68,23 @@ fn print_help() {
     println!("    rktop-ai [OPTIONS]");
     println!();
     println!("OPTIONS:");
-    println!("    -j, --json       Output a single JSON telemetry snapshot to stdout and exit");
-    println!("    -1, --oneshot    Output a single plaintext telemetry snapshot to stdout and exit");
-    println!("    -v, --version    Print version information and exit");
-    println!("    -h, --help       Print this help message and exit");
+    println!("    -j, --json               Output a single JSON telemetry snapshot to stdout and exit");
+    println!("    -1, --oneshot            Output a single plaintext telemetry snapshot to stdout and exit");
+    println!("    -s, --stream [MS]        Stream continuous NDJSON snapshots at interval in ms (default: 200ms)");
+    println!("    -w, --watch [SECS]       Stream continuous NDJSON snapshots at interval in seconds (default: 1s)");
+    println!("    -p, --proc <names>       Track specific processes & thread-to-core placement (comma-separated)");
+    println!("    -v, --version            Print version information and exit");
+    println!("    -h, --help               Print this help message and exit");
     println!();
     println!("INTERACTIVE TUI CONTROLS:");
     println!("    q, Q, Esc        Quit");
     println!("    c / m / p / n    Sort processes by CPU / Memory / PID / Name");
     println!("    /                Filter processes by name");
     println!();
-    println!("AGENTIC AI USAGE EXAMPLE:");
+    println!("AGENTIC AI USAGE EXAMPLES:");
     println!("    sudo rktop-ai --json | jq .accelerator");
+    println!("    sudo rktop-ai --stream 100 --proc rkllm3-server,proxy");
+    println!("    sudo rktop-ai --oneshot --proc rkllm");
 }
 
 fn main() -> Result<()> {
@@ -115,6 +120,84 @@ fn main() -> Result<()> {
         std::process::exit(1);
     }
 
+    // Check for streaming / watch mode
+    let mut stream_interval_ms: Option<u64> = None;
+    let mut i = 1;
+    while i < args.len() {
+        let arg = &args[i];
+        if arg == "-s" || arg == "--stream" {
+            if i + 1 < args.len() && !args[i + 1].starts_with('-') {
+                if let Ok(ms) = args[i + 1].parse::<u64>() {
+                    stream_interval_ms = Some(ms.max(20)); // Minimum 20ms
+                    i += 1;
+                } else {
+                    stream_interval_ms = Some(200);
+                }
+            } else {
+                stream_interval_ms = Some(200);
+            }
+        } else if arg.starts_with("--stream=") {
+            let val = arg.trim_start_matches("--stream=");
+            stream_interval_ms = Some(val.parse::<u64>().unwrap_or(200).max(20));
+        } else if arg == "-w" || arg == "--watch" {
+            if i + 1 < args.len() && !args[i + 1].starts_with('-') {
+                if let Ok(secs) = args[i + 1].parse::<f64>() {
+                    stream_interval_ms = Some((secs * 1000.0) as u64);
+                    i += 1;
+                } else {
+                    stream_interval_ms = Some(1000);
+                }
+            } else {
+                stream_interval_ms = Some(1000);
+            }
+        } else if arg.starts_with("--watch=") {
+            let val = arg.trim_start_matches("--watch=");
+            let secs = val.parse::<f64>().unwrap_or(1.0);
+            stream_interval_ms = Some((secs * 1000.0) as u64);
+        }
+        i += 1;
+    }
+
+    // Check for --proc / -p
+    let mut tracked_procs: Vec<String> = Vec::new();
+    let mut j = 1;
+    while j < args.len() {
+        let arg = &args[j];
+        if arg == "-p" || arg == "--proc" {
+            if j + 1 < args.len() && !args[j + 1].starts_with('-') {
+                for pat in args[j + 1].split(',') {
+                    let clean = pat.trim();
+                    if !clean.is_empty() {
+                        tracked_procs.push(clean.to_string());
+                    }
+                }
+                j += 1;
+            }
+        } else if arg.starts_with("--proc=") {
+            let val = arg.trim_start_matches("--proc=");
+            for pat in val.split(',') {
+                let clean = pat.trim();
+                if !clean.is_empty() {
+                    tracked_procs.push(clean.to_string());
+                }
+            }
+        }
+        j += 1;
+    }
+
+    // Handle streaming snapshot mode
+    if let Some(interval_ms) = stream_interval_ms {
+        let mut sys = System::new_all();
+        let mut app_state = AppState::new();
+        stream_json_snapshots(
+            &mut sys,
+            &mut app_state,
+            Duration::from_millis(interval_ms),
+            &tracked_procs,
+        );
+        return Ok(());
+    }
+
     // Handle non-interactive snapshot modes (for AI agents, scripts, and monitoring)
     let is_json = args.iter().skip(1).any(|a| a == "-j" || a == "--json");
     let is_oneshot = args.iter().skip(1).any(|a| a == "-1" || a == "--oneshot");
@@ -123,9 +206,9 @@ fn main() -> Result<()> {
         let mut sys = System::new_all();
         let mut app_state = AppState::new();
         if is_json {
-            print_json_snapshot(&mut sys, &mut app_state);
+            print_json_snapshot(&mut sys, &mut app_state, &tracked_procs);
         } else {
-            print_oneshot_snapshot(&mut sys, &mut app_state);
+            print_oneshot_snapshot(&mut sys, &mut app_state, &tracked_procs);
         }
         return Ok(());
     }
@@ -1205,13 +1288,18 @@ fn render_stats_panel(f: &mut Frame, area: Rect, sys: &System, app_state: &AppSt
     // Total processes
     let total_processes = sys.processes().len();
 
-    let lines = vec![
+    let mut lines = vec![
         Line::from(format!("Uptime:     {}", uptime_str)),
         Line::from(format!("Load Avg:   {}", load_str)),
         Line::from(format!("Governor:   {}", app_state.cpu_governor)),
         Line::from(format!("Processes:  {}", total_processes)),
         Line::from(format!("TCP Conns:  {}", app_state.tcp_connections)),
     ];
+
+    if let Some(dmc_freq) = get_dmc_frequency() {
+        let gov = get_dmc_governor().unwrap_or_else(|| "unknown".to_string());
+        lines.push(Line::from(format!("DMC / DDR:  {} MHz ({})", dmc_freq, gov)));
+    }
 
     let block = Block::default()
         .title("Stats")

@@ -387,6 +387,93 @@ pub fn get_npu_frequency() -> Option<u32> {
     }
 }
 
+static DMC_DIR_PATH: OnceLock<Option<String>> = OnceLock::new();
+static DMC_FREQ_PATH: OnceLock<Option<String>> = OnceLock::new();
+static DMC_GOV_PATH: OnceLock<Option<String>> = OnceLock::new();
+
+pub fn get_dmc_dir_path() -> Option<&'static str> {
+    DMC_DIR_PATH.get_or_init(|| {
+        let devfreq_dir = "/sys/class/devfreq";
+        if let Ok(entries) = fs::read_dir(devfreq_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name == "dmc" || name.contains("dmc") || name.contains("ddr") {
+                    let candidate = entry.path();
+                    if candidate.join("cur_freq").exists() {
+                        return Some(candidate.to_string_lossy().to_string());
+                    }
+                }
+            }
+        }
+        None
+    }).as_deref()
+}
+
+pub fn get_dmc_freq_path() -> Option<&'static str> {
+    DMC_FREQ_PATH.get_or_init(|| {
+        get_dmc_dir_path().map(|dir| format!("{}/cur_freq", dir))
+    }).as_deref()
+}
+
+pub fn get_dmc_gov_path() -> Option<&'static str> {
+    DMC_GOV_PATH.get_or_init(|| {
+        get_dmc_dir_path().map(|dir| format!("{}/governor", dir))
+    }).as_deref()
+}
+
+/// Read DMC (DDR) current frequency in MHz (using cached file descriptors)
+pub fn get_dmc_frequency() -> Option<u32> {
+    if let Some(path) = get_dmc_freq_path() {
+        read_cached_file(path)
+            .ok()
+            .and_then(|content| content.trim().parse::<u64>().ok())
+            .map(|freq_hz| (freq_hz / 1_000_000) as u32)
+    } else {
+        None
+    }
+}
+
+/// Read DMC (DDR) current governor (using cached file descriptors)
+pub fn get_dmc_governor() -> Option<String> {
+    if let Some(path) = get_dmc_gov_path() {
+        read_cached_file(path)
+            .ok()
+            .map(|content| content.trim().to_string())
+            .filter(|s| !s.is_empty())
+    } else {
+        None
+    }
+}
+
+/// Read DMC (DDR) available frequencies in MHz (sorted ascending)
+pub fn get_dmc_available_frequencies() -> Vec<u32> {
+    if let Some(dir) = get_dmc_dir_path() {
+        let path = format!("{}/available_frequencies", dir);
+        if let Ok(content) = fs::read_to_string(path) {
+            let mut freqs: Vec<u32> = content
+                .split_whitespace()
+                .filter_map(|s| s.parse::<u64>().ok())
+                .map(|hz| (hz / 1_000_000) as u32)
+                .collect();
+            freqs.sort_unstable();
+            freqs.dedup();
+            return freqs;
+        }
+    }
+    Vec::new()
+}
+
+/// Read DMC (DDR) available governors
+pub fn get_dmc_available_governors() -> Vec<String> {
+    if let Some(dir) = get_dmc_dir_path() {
+        let path = format!("{}/available_governors", dir);
+        if let Ok(content) = fs::read_to_string(path) {
+            return content.split_whitespace().map(|s| s.to_string()).collect();
+        }
+    }
+    Vec::new()
+}
+
 /// Read NPU load percentages for each core (using cached file descriptors)
 pub fn get_npu_load() -> Vec<u8> {
     let path = "/sys/kernel/debug/rknpu/load";
@@ -617,6 +704,9 @@ fn extract_version_from_binary(path: &str, pattern: &str) -> String {
         Err(_) => return "Not Detected".to_string(),
     };
 
+    static RE_VERSION: OnceLock<Regex> = OnceLock::new();
+    let re = RE_VERSION.get_or_init(|| Regex::new(r"(\d+\.\d+\.\d+)").unwrap());
+
     // For ELF binaries, search through the .rodata section
     if let Object::Elf(elf) = obj {
         for section in elf.section_headers.iter() {
@@ -635,7 +725,6 @@ fn extract_version_from_binary(path: &str, pattern: &str) -> String {
                         // Find the pattern and extract version number
                         if let Some(pos) = text.find(pattern) {
                             let substr = &text[pos..];
-                            let re = Regex::new(r"(\d+\.\d+\.\d+)").unwrap();
                             if let Some(cap) = re.captures(substr) {
                                 return cap[1].to_string();
                             }
@@ -649,12 +738,97 @@ fn extract_version_from_binary(path: &str, pattern: &str) -> String {
     "Not Detected".to_string()
 }
 
+/// Find path of a shared library by checking running processes (/proc/*/maps),
+/// LD_LIBRARY_PATH, and standard/custom search locations.
+fn find_library_path(lib_name: &str) -> Option<String> {
+    use std::io::{BufRead, BufReader};
+
+    // 1. Inspect running processes in /proc to see if any process currently maps the library into memory.
+    // Stream line-by-line using BufReader to prevent buffering multi-megabyte maps files into memory.
+    if let Ok(entries) = fs::read_dir("/proc") {
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let name_str = file_name.to_string_lossy();
+            if name_str.chars().all(|c| c.is_ascii_digit()) {
+                let maps_path = entry.path().join("maps");
+                if let Ok(file) = fs::File::open(&maps_path) {
+                    let reader = BufReader::new(file);
+                    for line_res in reader.lines() {
+                        if let Ok(line) = line_res {
+                            if line.contains(lib_name) {
+                                if let Some(path_str) = line.split_whitespace().last() {
+                                    if path_str.starts_with('/') && Path::new(path_str).exists() {
+                                        return Some(path_str.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Candidate filesystem paths
+    let mut candidate_paths = vec![
+        format!("/usr/lib/{}", lib_name),
+        format!("/usr/lib64/{}", lib_name),
+        format!("/usr/local/lib/{}", lib_name),
+        format!("/usr/lib/aarch64-linux-gnu/{}", lib_name),
+        format!("./{}", lib_name),
+        format!("./lib/{}", lib_name),
+    ];
+
+    // Check LD_LIBRARY_PATH
+    if let Ok(ld_path) = std::env::var("LD_LIBRARY_PATH") {
+        for dir in ld_path.split(':') {
+            let clean = dir.trim();
+            if !clean.is_empty() {
+                candidate_paths.push(format!("{}/{}", clean.trim_end_matches('/'), lib_name));
+            }
+        }
+    }
+
+    // Common deployment directories
+    let bases = ["/home", "/opt", "/data"];
+    for base in &bases {
+        if let Ok(entries) = fs::read_dir(base) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                candidate_paths.push(p.join(lib_name).to_string_lossy().to_string());
+                candidate_paths.push(p.join(format!("lib/{}", lib_name)).to_string_lossy().to_string());
+                candidate_paths.push(p.join(format!("rkllm-runtime/lib/{}", lib_name)).to_string_lossy().to_string());
+            }
+        }
+    }
+
+    for path in candidate_paths {
+        if Path::new(&path).exists() {
+            return Some(path);
+        }
+    }
+
+    None
+}
+
 /// Read librknnrt library version
 pub fn get_librknnrt_version() -> String {
+    if let Some(path) = find_library_path("librknnrt.so") {
+        let ver = extract_version_from_binary(&path, "librknnrt version:");
+        if ver != "Not Detected" {
+            return ver;
+        }
+    }
     extract_version_from_binary("/usr/lib/librknnrt.so", "librknnrt version:")
 }
 
-/// Read librkllmrt library version
+/// Read librkllmrt library version (scans running processes, LD_LIBRARY_PATH, and custom dirs)
 pub fn get_librkllmrt_version() -> String {
+    if let Some(path) = find_library_path("librkllmrt.so") {
+        let ver = extract_version_from_binary(&path, "RKLLM SDK (version:");
+        if ver != "Not Detected" {
+            return ver;
+        }
+    }
     extract_version_from_binary("/usr/lib/librkllmrt.so", "RKLLM SDK (version:")
 }
