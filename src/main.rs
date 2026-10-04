@@ -258,7 +258,14 @@ impl AppState {
         let network_adapters = get_network_adapters();
         let thermal_zone_paths = get_thermal_zone_paths();
 
-        Self {
+        let initial_cpu_stats = get_cpu_stats();
+        let running_procs = initial_cpu_stats.running_procs;
+        let blocked_procs = initial_cpu_stats.blocked_procs;
+        let prev_ctx_switches = initial_cpu_stats.context_switches;
+        let prev_interrupts = initial_cpu_stats.interrupts;
+        let prev_softirqs = initial_cpu_stats.softirqs;
+
+        let mut state = Self {
             prev_disk_read: 0,
             prev_disk_write: 0,
             prev_net_rx: 0,
@@ -289,11 +296,11 @@ impl AppState {
             thermal_zone_paths,
             cpu_governor: String::new(),
             tcp_connections: 0,
-            last_stats_update: Instant::now(),
+            last_stats_update: Instant::now() - Duration::from_secs(10),
             process_sort_mode: ProcessSortMode::CpuDesc,
-            prev_ctx_switches: 0,
-            prev_interrupts: 0,
-            prev_softirqs: 0,
+            prev_ctx_switches,
+            prev_interrupts,
+            prev_softirqs,
             ctx_switches_rate: 0,
             interrupts_rate: 0,
             softirqs_rate: 0,
@@ -302,16 +309,18 @@ impl AppState {
             cpu_system_pct: 0.0,
             cpu_iowait_pct: 0.0,
             cpu_idle_pct: 0.0,
-            prev_cpu_time: CpuStats::default(),
-            running_procs: 0,
-            blocked_procs: 0,
+            prev_cpu_time: initial_cpu_stats,
+            running_procs,
+            blocked_procs,
             cpu_history: VecDeque::new(),
             gpu_history: VecDeque::new(),
             npu_history: VecDeque::new(),
             accelerator_history: VecDeque::new(),
             filter_text: String::new(),
             filter_mode: false,
-        }
+        };
+        state.update_stats();
+        state
     }
 
     fn update_history(&mut self, total_cpu: f32) {
@@ -353,11 +362,11 @@ impl AppState {
     }
 
     pub fn update_cpu_stats(&mut self) {
-        // Update CPU stats every second for smooth rates
+        // Update CPU stats periodically (every 0.2s or more) for smooth rates
         let cpu_stats = get_cpu_stats();
         let elapsed = self.prev_cpu_stats_time.elapsed().as_secs_f64();
 
-        if elapsed >= 1.0 {
+        if elapsed >= 0.2 {
             // Calculate rates per second
             self.ctx_switches_rate = ((cpu_stats.context_switches - self.prev_ctx_switches) as f64 / elapsed) as u64;
             self.interrupts_rate = ((cpu_stats.interrupts - self.prev_interrupts) as f64 / elapsed) as u64;

@@ -111,7 +111,11 @@ pub fn collect_snapshot(sys: &mut System, app_state: &mut AppState) -> SystemSna
 
     let per_core_pct: Vec<f32> = sys.cpus().iter().map(|c| c.cpu_usage()).collect();
     let per_core_freq_mhz: Vec<u32> = sys.cpus().iter().map(|c| c.frequency() as u32).collect();
-    let total_load_pct = (100.0 - app_state.cpu_idle_pct as f32).clamp(0.0, 100.0);
+    let total_load_pct = if !per_core_pct.is_empty() {
+        per_core_pct.iter().sum::<f32>() / per_core_pct.len() as f32
+    } else {
+        (100.0 - app_state.cpu_idle_pct as f32).clamp(0.0, 100.0)
+    };
 
     let host = HostInfo {
         board: app_state.board_name.clone(),
