@@ -2,11 +2,8 @@
 
 A high-performance system monitoring tool for Rockchip SoC devices (RK3576, RK3588, RK3399) and dedicated PCIe AI accelerator cards (RK1828, RK1820, RM1828MC0-F), written in Rust using the Ratatui TUI framework.
 
-![rktop-ai on Rockchip RK3576 with PCIe RK1828 AI Accelerator](screenshots/rktop-ai-accelerator.png)
-*Live telemetry on DFRobot ACM3576 board with PCIe RK1828 AI accelerator active (76% load @ 850 MHz, 1638 / 5120 MB VRAM).*
-
-![rktop-ai on Rockchip RK3576 with Host Onboard RKNPU2](screenshots/rktop-ai-host-npu.png)
-*Live telemetry showing host RK3576 dual-core RKNPU2 active (Core 0: 25%, Core 1: 22% @ 950 MHz).*
+![rktop-ai live monitoring on Rockchip RK3576 with PCIe RK1828 AI Accelerator](screenshots/rktop-ai.png)
+*Live telemetry during active LLM inference and voice TTS workload on DFRobot ACM3576 board with PCIe RK1828 AI accelerator (showing per-core CPU load and cluster frequencies, thread-to-core affinity for GemmaTeacher worker threads, dedicated VRAM, thermals, and accelerator status).*
 
 ### Extended Capabilities:
 - **Host SoC Telemetry**: Real-time per-core CPU, Mali GPU, onboard RKNPU2, memory, RGA, and thermal sensors across RK3576/RK3588/RK3399 platforms.
