@@ -1,6 +1,7 @@
 use regex::Regex;
 use std::fs;
 use std::path::Path;
+use std::sync::OnceLock;
 use goblin::Object;
 use crate::file_cache::{read_cached_file, read_cached_u32, read_cached_i32};
 
@@ -88,7 +89,7 @@ pub fn get_thermal_zone_paths() -> Vec<(String, String, String)> {
 
                     // Read the type to get the label
                     if let Ok(type_content) = fs::read_to_string(&type_path) {
-                        let label = type_content.trim().replace("_thermal", "");
+                        let label = type_content.trim().replace("_thermal", "").replace("-thermal", "");
                         paths.push((label, temp_path, type_path));
                     }
                 }
@@ -206,6 +207,18 @@ pub fn get_gpu_usage() -> Option<f32> {
             return Some((busy_time as f32 / total_time as f32) * 100.0);
         }
     }
+
+    // Fallback: check devfreq load (e.g. /sys/class/devfreq/*.gpu/load)
+    if let Some(load_path) = get_gpu_load_path() {
+        if let Ok(content) = read_cached_file(load_path) {
+            // Devfreq load format is typically "0@300000000Hz" or "0"
+            if let Some(pct_str) = content.split('@').next() {
+                if let Ok(pct) = pct_str.trim().parse::<f32>() {
+                    return Some(pct);
+                }
+            }
+        }
+    }
     None
 }
 
@@ -257,30 +270,121 @@ pub fn get_cpu_freq_ranges() -> Vec<(u32, u32)> {
     ranges
 }
 
-/// Read GPU frequency
-pub fn get_gpu_frequency() -> Option<u32> {
-    let paths = [
-        "/sys/devices/platform/fb000000.gpu-panthor/devfreq/fb000000.gpu-panthor/cur_freq",
-        "/sys/class/devfreq/fb000000.gpu/cur_freq",
-    ];
-
-    for path in &paths {
-        if let Ok(content) = fs::read_to_string(path) {
-            if let Ok(freq_hz) = content.trim().parse::<u64>() {
-                return Some((freq_hz / 1_000_000) as u32); // Convert to MHz
+/// Find a devfreq cur_freq path matching pattern (e.g. ".gpu", ".npu")
+pub fn find_devfreq_cur_freq_path(pattern: &str) -> Option<String> {
+    let devfreq_dir = "/sys/class/devfreq";
+    if let Ok(entries) = fs::read_dir(devfreq_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.ends_with(pattern) || name.contains(pattern) {
+                let candidate = entry.path().join("cur_freq");
+                if candidate.exists() {
+                    return Some(candidate.to_string_lossy().to_string());
+                }
             }
         }
     }
     None
 }
 
+/// Find a devfreq load path matching pattern (e.g. ".gpu")
+pub fn find_devfreq_load_path(pattern: &str) -> Option<String> {
+    let devfreq_dir = "/sys/class/devfreq";
+    if let Ok(entries) = fs::read_dir(devfreq_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.ends_with(pattern) || name.contains(pattern) {
+                let candidate = entry.path().join("load");
+                if candidate.exists() {
+                    return Some(candidate.to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+static GPU_FREQ_PATH: OnceLock<Option<String>> = OnceLock::new();
+static GPU_LOAD_PATH: OnceLock<Option<String>> = OnceLock::new();
+static NPU_FREQ_PATH: OnceLock<Option<String>> = OnceLock::new();
+
+pub fn get_gpu_freq_path() -> Option<&'static str> {
+    GPU_FREQ_PATH.get_or_init(|| {
+        if let Some(p) = find_devfreq_cur_freq_path(".gpu") {
+            return Some(p);
+        }
+        let paths = [
+            "/sys/devices/platform/fb000000.gpu-panthor/devfreq/fb000000.gpu-panthor/cur_freq",
+            "/sys/class/devfreq/27800000.gpu/cur_freq",
+            "/sys/class/devfreq/fb000000.gpu/cur_freq",
+        ];
+        for path in &paths {
+            if Path::new(path).exists() {
+                return Some(path.to_string());
+            }
+        }
+        None
+    }).as_deref()
+}
+
+pub fn get_gpu_load_path() -> Option<&'static str> {
+    GPU_LOAD_PATH.get_or_init(|| {
+        if let Some(p) = find_devfreq_load_path(".gpu") {
+            return Some(p);
+        }
+        let paths = [
+            "/sys/class/devfreq/27800000.gpu/load",
+            "/sys/class/devfreq/fb000000.gpu/load",
+        ];
+        for path in &paths {
+            if Path::new(path).exists() {
+                return Some(path.to_string());
+            }
+        }
+        None
+    }).as_deref()
+}
+
+pub fn get_npu_freq_path() -> Option<&'static str> {
+    NPU_FREQ_PATH.get_or_init(|| {
+        if let Some(p) = find_devfreq_cur_freq_path(".npu") {
+            return Some(p);
+        }
+        let paths = [
+            "/sys/class/devfreq/27700000.npu/cur_freq",
+            "/sys/class/devfreq/fdab0000.npu/cur_freq",
+        ];
+        for path in &paths {
+            if Path::new(path).exists() {
+                return Some(path.to_string());
+            }
+        }
+        None
+    }).as_deref()
+}
+
+/// Read GPU frequency (using cached file descriptors)
+pub fn get_gpu_frequency() -> Option<u32> {
+    if let Some(path) = get_gpu_freq_path() {
+        read_cached_file(path)
+            .ok()
+            .and_then(|content| content.trim().parse::<u64>().ok())
+            .map(|freq_hz| (freq_hz / 1_000_000) as u32)
+    } else {
+        None
+    }
+}
+
 /// Read NPU frequency (using cached file descriptors)
 pub fn get_npu_frequency() -> Option<u32> {
-    let path = "/sys/class/devfreq/fdab0000.npu/cur_freq";
-    read_cached_file(path)
-        .ok()
-        .and_then(|content| content.trim().parse::<u64>().ok())
-        .map(|freq_hz| (freq_hz / 1_000_000) as u32)
+    if let Some(path) = get_npu_freq_path() {
+        read_cached_file(path)
+            .ok()
+            .and_then(|content| content.trim().parse::<u64>().ok())
+            .map(|freq_hz| (freq_hz / 1_000_000) as u32)
+    } else {
+        None
+    }
 }
 
 /// Read NPU load percentages for each core (using cached file descriptors)
@@ -377,10 +481,33 @@ pub fn get_board_name() -> String {
 pub fn get_rk_model() -> String {
     let board_name = get_board_name();
 
+    static RE_RK: OnceLock<Regex> = OnceLock::new();
+    static RE_ACM: OnceLock<Regex> = OnceLock::new();
+
     // Extract RKxxxx pattern
-    let re = Regex::new(r"\b(RK\d+)\b").unwrap();
+    let re = RE_RK.get_or_init(|| Regex::new(r"(?i)\b(RK\d+)\b").unwrap());
     if let Some(cap) = re.captures(&board_name) {
         return cap[1].to_uppercase();
+    }
+
+    // Check device tree compatible nodes (e.g. "rockchip,rk3576")
+    let compat_paths = [
+        "/proc/device-tree/compatible",
+        "/sys/firmware/devicetree/base/compatible",
+    ];
+    for path in &compat_paths {
+        if let Ok(content) = fs::read(path) {
+            let text = String::from_utf8_lossy(&content);
+            if let Some(cap) = re.captures(&text) {
+                return cap[1].to_uppercase();
+            }
+        }
+    }
+
+    // Check for ACMxxxx pattern (e.g. DFRobot ACM3576 -> RK3576)
+    let re_acm = RE_ACM.get_or_init(|| Regex::new(r"(?i)\bACM(\d+)\b").unwrap());
+    if let Some(cap) = re_acm.captures(&board_name) {
+        return format!("RK{}", &cap[1]);
     }
 
     "Unknown RK".to_string()

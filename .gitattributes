@@ -1,0 +1,40 @@
+# Auto-detect text files and normalize line endings to LF by default
+* text=auto eol=lf
+
+# Explicitly enforce LF for Rust source, TOML, Markdown, shell scripts, JSON, YAML
+*.rs text eol=lf
+*.toml text eol=lf
+*.md text eol=lf
+*.sh text eol=lf
+*.bash text eol=lf
+*.json text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.txt text eol=lf
+.gitattributes text eol=lf
+.gitignore text eol=lf
+.mailmap text eol=lf
+
+# Windows batch files require CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# PowerShell scripts (LF compatible on modern pwsh)
+*.ps1 text eol=lf
+
+# Binary files - prevent any line ending transformation or corruption
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.so binary
+*.a binary
+*.dylib binary
+*.dll binary
+*.exe binary
+*.bin binary
+*.tar binary
+*.gz binary
+*.zip binary

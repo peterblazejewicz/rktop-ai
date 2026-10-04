@@ -1,88 +1,104 @@
-# rktop - Rockchip System Monitor
+# rktop-ai — Rockchip System & AI Accelerator Monitor
 
-A high-performance system monitoring tool specifically designed for Rockchip SoC devices (RK3588, RK3399, etc.), written in Rust using the Ratatui TUI framework.
+A high-performance system monitoring tool for Rockchip SoC devices (RK3576, RK3588, RK3399) and dedicated PCIe AI accelerator cards (RK1828, RK1820, RM1828MC0-F), written in Rust using the Ratatui TUI framework.
 
 ![rktop screenshot](screenshots/rktop.png)
+
+### Extended Capabilities:
+- **Host SoC Telemetry**: Real-time per-core CPU, Mali GPU, onboard RKNPU2, memory, RGA, and thermal sensors across RK3576/RK3588/RK3399 platforms.
+- **Dedicated AI Coprocessors**: Real-time NPU utilization, dedicated DDR/VRAM usage, coprocessor CPU load, frequency, operating temperature, and power for Rockchip PCIe accelerator cards via `rknn-smi`.
+- **Process & System Stats**: Interactive process sorting, system load averages, network I/O, and disk telemetry with <0.5% CPU overhead.
+
+---
 
 ## Features
 
 ### Hardware Monitoring
-- **CPU**: Per-core usage, frequencies, time breakdown (user/system/iowait/idle)
-- **GPU (Mali)**: Utilization percentage and frequency
-- **NPU**: Per-core load and frequency
-- **RGA**: Graphics accelerator scheduler load (shows all RGA cores)
-- **Memory**: RAM, Swap, and ZRAM usage with detailed statistics
-- **Temperatures**: All thermal sensors (CPU, GPU, NPU, etc.)
-- **Network & Disk I/O**: Real-time transfer rates per adapter
+- **CPU**: Per-core usage, frequencies, and time breakdown (user/system/iowait/idle)
+- **GPU (Mali)**: Utilization percentage and frequency via Panthor or Bifrost devfreq/debugfs
+- **Host NPU (RKNPU2)**: Per-core load (0–2 cores on RK3576, 0–3 cores on RK3588) and dynamic frequency
+- **PCIe AI Accelerator (RK1828 / RM1828MC0-F)**:
+  - Real-time NPU utilization percentage, clock frequency, and sparkline history
+  - Dedicated onboard VRAM gauge (e.g. `1600 MB / 5120 MB` LPDDR)
+  - Coprocessor CPU load and operating frequency
+  - Board temperature, power consumption (mW), PCIe bus ID (`0000:01:00.0`), and card health
+- **RGA**: 2D graphics accelerator scheduler load across all RGA cores
+- **Memory**: RAM, Swap, and ZRAM usage with compression ratio and breakdown
+- **Temperatures**: Thermal sensors for CPU, GPU, NPU, and ambient zones
+- **Network & Disk I/O**: Real-time throughput rates per network adapter and storage device
 
 ### Process Information
 - **Interactive Sorting**: Sort by CPU, Memory, PID, or Name (ascending/descending)
 - **Detailed Metrics**: PID, User, Nice level, CPU core affinity, Runtime, CPU%, Memory%
-- **Dynamic Display**: Shows as many processes as fit in the terminal
+- **Dynamic Display**: Adaptive layout fitting any terminal dimensions
 
-### System Statistics
-- System uptime and load average
+### System Statistics & Version Probing
+- System uptime, hostname, kernel release, and load average (1/5/15 min)
 - CPU governor and frequency ranges (per cluster)
-- Running and blocked process counts
 - Context switches, interrupts, and softirqs per second
-- External TCP connection count
+- Active TCP connection count
+- NPU and RGA kernel driver versions
+- Host RKNN and RKLLM runtime library versions
+- Dedicated AI Accelerator model and PCIe bus address
 
-### Driver & Runtime Versions
-- NPU kernel driver version
-- RGA kernel driver version
-- RKNN Runtime library version
-- RKLLM Runtime library version
+---
 
 ## Performance
 
-Optimized for minimal CPU overhead:
-- **<1% CPU usage** during normal operation
-- Cached static information (versions, hardware availability)
-- UID-to-username caching (eliminates process spawns)
-- Throttled refresh rates (1s/2s/3s/5s for different data types)
-- Efficient hardware detection (checks availability once at startup)
+Engineered for zero interference with edge AI workloads and zero thermal penalties:
+- **<0.5% CPU Overhead**: Zero busy-loops; events synchronised with terminal ticks.
+- **Cached File Descriptors (`src/file_cache.rs`)**: Retains open handles for sysfs and procfs nodes, avoiding repetitive `open()` / `close()` kernel context switches.
+- **Streaming Telemetry Daemon (`src/accelerator.rs`)**: Spawns `/bin/rknn-smi info -w` once in a long-lived background thread instead of spawning expensive processes repeatedly.
+- **Kernel-Guaranteed Process Safety**: Uses Unix `libc::prctl(PR_SET_PDEATHSIG, SIGTERM)` and explicit PID management to ensure child processes are never orphaned or left as zombies.
+- **Dynamic Devfreq Path Scanning**: Discovers SoC frequency and load nodes once at startup with `OnceLock` caching.
+
+---
 
 ## Installation
 
 ### Prerequisites
-
-- Rockchip SoC-based device (RK3588, RK3399, etc.)
+- Rockchip SoC device (RK3576, RK3588, RK3399, etc.)
 - Linux with sysfs and debugfs mounted
-- Rust toolchain (for installing from crates.io or building from source)
-
-### Install from crates.io
-
-The easiest way to install rktop is via cargo:
-
-```bash
-cargo install rktop
-```
-
-This will download, compile, and install the latest version from [crates.io](https://crates.io/crates/rktop).
+- Rust toolchain (or prebuilt cross-compiled binary)
 
 ### Building from Source
 
 ```bash
 # Clone the repository
 git clone https://github.com/ajokela/rktop.git
-cd rktop
+cd rktop-ai
 
-# Build release binary
+# Build optimized release binary
 cargo build --release
 
-# Binary will be at target/release/rktop
+# Binary will be at target/release/rktop-ai
 ```
 
-### Installing System-Wide
+### Cross-Compiling for aarch64 (Linux / WSL2)
+
+Cross-compilation from Ubuntu/WSL2 targeting 64-bit ARM:
 
 ```bash
-# If installed via cargo
-# Binary is already in ~/.cargo/bin/ (ensure it's in your PATH)
+# Install GCC aarch64 toolchain
+sudo apt-get install -y gcc-aarch64-linux-gnu
 
-# If built from source, copy to system path
-sudo cp target/release/rktop /usr/local/bin/
-sudo chmod +x /usr/local/bin/rktop
+# Add Rust target
+rustup target add aarch64-unknown-linux-gnu
+
+# Build and strip
+cargo build --target aarch64-unknown-linux-gnu --release
+aarch64-linux-gnu-strip target/aarch64-unknown-linux-gnu/release/rktop-ai
 ```
+
+### System-Wide Installation
+
+```bash
+# Copy to system path
+sudo cp target/release/rktop-ai /usr/local/bin/
+sudo chmod +x /usr/local/bin/rktop-ai
+```
+
+---
 
 ## Usage
 
@@ -90,237 +106,85 @@ sudo chmod +x /usr/local/bin/rktop
 
 ```bash
 # Run with root privileges (required for debugfs access)
-sudo rktop
+sudo rktop-ai
 ```
 
 ### Keyboard Controls
 
 | Key | Action |
-|-----|--------|
-| `q`, `Q`, `Esc` | Quit |
-| `c` | Toggle CPU sort (ascending/descending) |
-| `m` | Toggle Memory sort (ascending/descending) |
-| `p` | Toggle PID sort (ascending/descending) |
-| `n` | Toggle Name sort (ascending/descending) |
+|:---:|:---|
+| `q`, `Q`, `Esc` | Quit application |
+| `c` | Toggle CPU sort (ascending / descending) |
+| `m` | Toggle Memory sort (ascending / descending) |
+| `p` | Toggle PID sort (ascending / descending) |
+| `n` | Toggle Name sort (ascending / descending) |
 
 ### Running Without Root (Optional)
 
-You can grant specific capabilities to avoid requiring root:
+You can grant specific capabilities to run without `sudo`:
 
 ```bash
-# Grant file read and process trace capabilities
-sudo setcap cap_dac_read_search,cap_sys_ptrace=eip /usr/local/bin/rktop
-
-# Now you can run without sudo
-rktop
+sudo setcap cap_dac_read_search,cap_sys_ptrace=eip /usr/local/bin/rktop-ai
+rktop-ai
 ```
 
-**Note**: Capabilities are removed if the binary is modified. Re-run `setcap` after updates.
+---
 
 ## Display Panels
 
 ### CPU Panel
-- Per-core usage bars with frequency
+- Per-core usage bars with real-time frequency
 - CPU time breakdown (User, System, IOWait, Idle percentages)
-- Frequency ranges for each CPU cluster (big.LITTLE)
-- Running and blocked process counts
-- Context switches, interrupts, and softirqs per second
+- Cluster frequency ranges (big.LITTLE)
+- Process state counts, context switches, interrupts, and softirqs
 
 ### Memory Panel
 - RAM usage (used + cached / total)
-- Swap usage
-- ZRAM usage with compression ratio
-- Detailed breakdown (Total, Free, Used, Cache, Shared)
+- Swap and ZRAM usage with real-time compression ratio
 
 ### GPU Panel (if available)
-- Mali GPU utilization percentage
-- Current GPU frequency
+- Mali GPU utilization percentage and clock frequency (Panthor / Bifrost)
 
-### NPU Panel (if available)
-- Per-core NPU load (0-2 cores typical)
-- NPU frequency
+### Host NPU Panel (if available)
+- Per-core onboard RKNPU2 load and frequency
 
-### RGA Panel (if available)
-- Per-scheduler load for all RGA cores
-- RK3588 example: rga3_0, rga3_1, rga2_2
+### AI Accelerator Panel (if PCIe card detected)
+- Dedicated NPU load bar with clock frequency
+- Dedicated VRAM gauge (e.g. `1599 / 5120 MB`)
+- Coprocessor CPU utilization and frequency
+- Card temperature, PCIe bus ID, power draw, and health status
+- Historical sparkline activity graph
 
 ### System Info Panel
-- Board name and SoC model
-- NPU driver version
-- RGA driver version
-- RKNN Runtime version
-- RKLLM Runtime version
+- Board name, SoC model, hostname, kernel release, and CPU architecture
+- NPU driver, RGA driver, RKNN runtime, and RKLLM runtime versions
+- AI Card model (`RK1828`) and PCIe bus address (`0000:01:00.0`)
 
-### Stats Panel
-- System uptime
-- Load average (1/5/15 min)
-- CPU governor
-- Total process count
-- External TCP connections
-
-### I/O Panel
-- Disk read/write rates
-- Network RX/TX rates (total)
-- Per-adapter network rates
-
-### Temperature Panel
-- All thermal sensors
-- Real-time temperature readings
-
-### Process Panel
-- **PID** - Process ID
-- **User** - Username
-- **NI** - Nice level (priority)
-- **C** - Current CPU core (0-7)
-- **Time** - Process runtime (MM:SS or HH:MM:SS)
-- **Name** - Process name
-- **CPU%** - CPU usage
-- **Mem%** - Memory usage
+---
 
 ## Architecture
 
 ### Multi-Module Design
 
-- **src/main.rs** - Main application, TUI rendering, event loop, state management
-- **src/hardware.rs** - Rockchip-specific hardware detection and monitoring
-- **src/sysinfo_ext.rs** - Extended system information (processes, ZRAM, TCP stats)
+- **`src/main.rs`** — Ratatui TUI rendering, event loop, double-buffered terminal layouts, and state management.
+- **`src/accelerator.rs`** — PCIe AI accelerator monitor, async stream parser, zero-orphan process lifecycle management.
+- **`src/hardware.rs`** — Dynamic devfreq scanning, Rockchip SoC probing, RKNPU2, GPU, and RGA telemetry.
+- **`src/file_cache.rs`** — Open file descriptor pool eliminating repetitive `open()` / `close()` syscalls.
+- **`src/sysinfo_ext.rs`** — Extended system metrics (per-process stats, ZRAM, TCP connections).
 
-### Key Design Patterns
+---
 
-**Caching for Performance**
-- Static information cached at startup (board name, versions, hardware availability)
-- Hardware availability checks prevent unnecessary sysfs reads every frame
-- UID-to-username mapping cached to eliminate process spawns
+## Supported Hardware
 
-**Throttled Refresh Intervals**
-- CPU/Memory: 1 second
-- Network/Disk I/O: 2 seconds
-- Processes: 3 seconds
-- Stats (uptime, load, governor, TCP): 5 seconds
+| Hardware | Support Details |
+|:---|:---|
+| **Rockchip RK3576** | Octa-core ARM (4x A72 + 4x A53), Mali-G52 MC3 (`27800000.gpu`), dual-core RKNPU2 (`27700000.npu`). Tested on DFRobot ACM3576. |
+| **Rockchip RK3588 / RK3588S** | Octa-core ARM (4x A76 + 4x A55), Mali-G610 MC4 (`fb000000.gpu`), triple-core RKNPU2 (`fdab0000.npu`). Tested on Orange Pi 5 Max. |
+| **Rockchip RK3399** | Hexa-core ARM (2x A72 + 4x A53), Mali-T860 MP4. |
+| **RM1828MC0-F PCIe AI Card** | Dedicated RK1828 NPU chip, 5120 MB LPDDR VRAM, PCIe endpoint `/dev/pcie-rkep*`, vendor `/bin/rknn-smi` interface. |
 
-**Graceful Hardware Detection**
-- Functions return `Option<T>` or empty values when hardware unavailable
-- UI panels conditionally render based on cached availability checks
-- Works on non-Rockchip systems (shows basic CPU/memory/process info)
-
-## Rockchip-Specific Features
-
-### Supported SoCs
-- RK3588 (tested on Orange Pi 5 Max)
-- RK3399
-- Other Rockchip SoCs with Mali GPU, NPU, and/or RGA
-
-### Hardware Interfaces
-The tool reads from Rockchip-specific kernel interfaces:
-
-**Debugfs** (requires root or capabilities):
-- `/sys/kernel/debug/mali0/` - GPU utilization
-- `/sys/kernel/debug/rknpu/` - NPU load and version
-- `/sys/kernel/debug/rkrga/` - RGA load and version
-
-**Sysfs** (standard access):
-- `/sys/devices/platform/fb000000.gpu-panthor/devfreq/` - GPU frequency
-- `/sys/class/devfreq/fdab0000.npu/` - NPU frequency
-- `/sys/devices/system/cpu/cpu*/cpufreq/` - CPU frequencies
-
-**Device Tree**:
-- `/proc/device-tree/model` - Board name and SoC detection
-
-### RK3588 Specifics
-
-**CPU Clusters**:
-- CPU 0-3: Big cores (typically 1800-2400 MHz)
-- CPU 4-7: LITTLE cores (408-2256 MHz)
-
-**RGA Cores**:
-- 3 schedulers total: 2× RGA3 + 1× RGA2
-- Displayed as: rga3_0, rga3_1, rga2_2
-
-**NPU Cores**:
-- 3 cores (Core 0, Core 1, Core 2)
-- Each with independent load monitoring
-
-## Troubleshooting
-
-### "Root permissions required" error
-The tool needs access to debugfs. Either:
-1. Run with `sudo rktop`
-2. Grant capabilities: `sudo setcap cap_dac_read_search,cap_sys_ptrace=eip /usr/local/bin/rktop`
-
-### GPU/NPU/RGA shows "not available"
-- Ensure debugfs is mounted: `mount | grep debugfs`
-- Check kernel drivers are loaded: `lsmod | grep -E "mali|npu|rga"`
-- Some boards may not have all accelerators
-
-### Version detection fails
-- Ensure runtime libraries are installed in `/usr/lib/`
-- Library paths may vary by distribution
-- Parses binary ELF files directly to extract versions
-
-### High CPU usage
-- Normal usage should be <1% CPU
-- If higher, check `strace` output: `sudo strace -c -p $(pgrep rktop)`
-- Verify caching is working (no excessive file opens)
-
-## Dependencies
-
-**Rust Crates**:
-- `ratatui` (0.28) - Terminal UI framework
-- `crossterm` (0.28) - Terminal manipulation and event handling
-- `sysinfo` (0.32) - System and process information
-- `regex` (1.11) - Regular expression parsing for hardware data
-- `anyhow` (1.0) - Error handling
-- `nix` (0.29) - Unix system calls (for root check)
-
-**System Requirements**:
-- Linux kernel with sysfs and debugfs support
-- For full features: Mali GPU, NPU, and RGA drivers loaded
-
-## Performance Notes
-
-From profiling with `strace -c`:
-- Zero subprocess spawns during normal operation (after startup)
-- Minimal file I/O through aggressive caching
-- <1% CPU usage on RK3588 (Orange Pi 5 Max)
-
-## Technical Details
-
-### Process Monitoring
-- Reads `/proc/[pid]/stat` for nice level and CPU core affinity
-- Uses sysinfo crate for CPU/memory usage
-- Implements global UID-to-username cache (Mutex-wrapped HashMap)
-- Reduces process spawns from 260+/sec to 0-2/sec
-
-### CPU Statistics
-- Parses `/proc/stat` for context switches, interrupts, softirqs
-- Calculates per-second rates from deltas
-- Computes CPU time percentages (user/system/iowait/idle)
-
-### Network Monitoring
-- Per-adapter RX/TX rate calculation
-- Refreshed every 2 seconds to reduce file I/O
-- Shows both aggregate and per-adapter statistics
-
-### Temperature Sensors
-- Reads from `/sys/class/thermal/thermal_zone*/`
-- Also checks `/sys/class/hwmon/` for additional sensors
-- Filters out duplicate thermal zones
-
-## Known Limitations
-
-- **Rockchip-specific**: Some features only work on Rockchip SoCs
-- **Debugfs access**: Requires root or capabilities for full functionality
-- **Library versions**: Library paths may vary by distribution
-- **No NPU process mapping**: Cannot show which process uses which NPU core (kernel limitation)
-
-## Related Projects
-
-- **[yarktop](https://github.com/emapco/yarktop)** - Python-based predecessor
+---
 
 ## License
 
 This project is licensed under the BSD 3-Clause License - see the [LICENSE](LICENSE) file for details.
-
-## Credits
-
-Developed for Rockchip SBC enthusiasts who want detailed hardware monitoring with minimal overhead.

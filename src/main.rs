@@ -20,9 +20,11 @@ use sysinfo::{Disks, Networks, ProcessesToUpdate, System};
 mod hardware;
 mod sysinfo_ext;
 mod file_cache;
+mod accelerator;
 
 use hardware::*;
 use sysinfo_ext::*;
+use accelerator::*;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ProcessSortMode {
@@ -60,7 +62,7 @@ impl Default for RefreshConfig {
 fn main() -> Result<()> {
     // Check for root permissions
     if !nix::unistd::geteuid().is_root() {
-        eprintln!("Root permissions required. Use: sudo rktop");
+        eprintln!("Root permissions required. Use: sudo rktop-ai");
         std::process::exit(1);
     }
 
@@ -107,6 +109,8 @@ struct AppState {
     // Cached static info
     board_name: String,
     rk_model: String,
+    hostname: String,
+    kernel_version: String,
     cpu_arch: String,
     npu_version: String,
     rga_version: String,
@@ -116,6 +120,8 @@ struct AppState {
     has_gpu: bool,
     has_npu: bool,
     has_rga: bool,
+    has_accelerator: bool,
+    accelerator: Option<AcceleratorMonitor>,
     // Cached CPU frequency ranges (don't change at runtime)
     cpu_freq_ranges: Vec<(u32, u32)>,
     // Cached network adapters (to avoid scanning /sys/class/net repeatedly)
@@ -149,6 +155,7 @@ struct AppState {
     cpu_history: VecDeque<f32>,
     gpu_history: VecDeque<f32>,
     npu_history: VecDeque<f32>,
+    accelerator_history: VecDeque<f32>,
     // Process filtering
     filter_text: String,
     filter_mode: bool, // true when actively editing filter
@@ -159,6 +166,14 @@ impl AppState {
         // Cache all static system info at startup (expensive operations)
         let board_name = get_board_name();
         let rk_model = get_rk_model();
+        let hostname = std::fs::read_to_string("/proc/sys/kernel/hostname")
+            .ok()
+            .map(|h| h.trim().to_string())
+            .unwrap_or_else(|| "Unknown".to_string());
+        let kernel_version = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+            .ok()
+            .map(|k| k.trim().to_string())
+            .unwrap_or_else(|| "Unknown".to_string());
         let cpu_arch = get_cpu_architecture();
         let npu_version = get_npu_driver_version();
         let rga_version = get_rga_version();
@@ -169,6 +184,8 @@ impl AppState {
         let has_gpu = get_gpu_usage().is_some();
         let has_npu = !get_npu_load().is_empty();
         let has_rga = get_rga_load().is_some();
+        let accelerator = AcceleratorMonitor::new();
+        let has_accelerator = accelerator.is_available();
 
         // Cache CPU frequency ranges (don't change at runtime)
         let cpu_freq_ranges = get_cpu_freq_ranges();
@@ -191,6 +208,8 @@ impl AppState {
             adapter_rates: HashMap::new(),
             board_name,
             rk_model,
+            hostname,
+            kernel_version,
             cpu_arch,
             npu_version,
             rga_version,
@@ -199,6 +218,8 @@ impl AppState {
             has_gpu,
             has_npu,
             has_rga,
+            has_accelerator,
+            accelerator: Some(accelerator),
             cpu_freq_ranges,
             network_adapters,
             thermal_zone_paths,
@@ -223,6 +244,7 @@ impl AppState {
             cpu_history: VecDeque::new(),
             gpu_history: VecDeque::new(),
             npu_history: VecDeque::new(),
+            accelerator_history: VecDeque::new(),
             filter_text: String::new(),
             filter_mode: false,
         }
@@ -252,6 +274,16 @@ impl AppState {
             self.npu_history.push_back(avg_npu);
             if self.npu_history.len() > MAX_HISTORY {
                 self.npu_history.pop_front();
+            }
+        }
+
+        // Update Accelerator history
+        if let Some(ref monitor) = self.accelerator {
+            if let Some(metrics) = monitor.get_metrics() {
+                self.accelerator_history.push_back(metrics.npu_load_pct as f32);
+                if self.accelerator_history.len() > MAX_HISTORY {
+                    self.accelerator_history.pop_front();
+                }
             }
         }
     }
@@ -794,17 +826,20 @@ fn render_right_panels(f: &mut Frame, area: Rect, app_state: &AppState, sys: &Sy
 
     // Use cached hardware availability instead of checking every frame
     if app_state.has_gpu {
-        constraints.push(Constraint::Length(6)); // Increased for sparkline
+        constraints.push(Constraint::Length(5)); // GPU
     }
     if app_state.has_npu {
-        constraints.push(Constraint::Length(7)); // Increased for sparkline
+        constraints.push(Constraint::Length(6)); // Host NPU
+    }
+    if app_state.has_accelerator {
+        constraints.push(Constraint::Length(7)); // PCIe AI Accelerator (includes sparkline)
     }
     if app_state.has_rga {
-        constraints.push(Constraint::Length(5));
+        constraints.push(Constraint::Length(5)); // RGA
     }
 
     // Add stats panel
-    constraints.push(Constraint::Length(8));
+    constraints.push(Constraint::Length(7));
     constraints.push(Constraint::Min(0));
 
     let chunks = Layout::default()
@@ -830,6 +865,12 @@ fn render_right_panels(f: &mut Frame, area: Rect, app_state: &AppState, sys: &Sy
         chunk_idx += 1;
     }
 
+    // PCIe AI Accelerator
+    if app_state.has_accelerator {
+        render_accelerator_panel(f, chunks[chunk_idx], app_state);
+        chunk_idx += 1;
+    }
+
     // RGA
     if app_state.has_rga {
         render_rga_panel(f, chunks[chunk_idx]);
@@ -841,26 +882,23 @@ fn render_right_panels(f: &mut Frame, area: Rect, app_state: &AppState, sys: &Sy
 }
 
 fn render_system_panel(f: &mut Frame, area: Rect, app_state: &AppState) {
-    // Use cached values instead of calling expensive functions every frame
+    let (ai_card, ai_pcie) = if let Some(ref m) = app_state.accelerator {
+        if m.is_available() {
+            (format!("AI Card: {}", m.chip_name()), format!("AI Bus:  {}", m.bus_id()))
+        } else {
+            (String::new(), String::new())
+        }
+    } else {
+        (String::new(), String::new())
+    };
 
-    // Read hostname and kernel for right column
-    let hostname = std::fs::read_to_string("/proc/sys/kernel/hostname")
-        .ok()
-        .map(|h| h.trim().to_string())
-        .unwrap_or_else(|| "Unknown".to_string());
-
-    let kernel = std::fs::read_to_string("/proc/sys/kernel/osrelease")
-        .ok()
-        .map(|k| k.trim().to_string())
-        .unwrap_or_else(|| "Unknown".to_string());
-
-    // Build table with two columns
+    // Build table with two columns using cached static info
     let row_data = vec![
-        (format!("Board: {}", app_state.board_name), format!("Host: {}", hostname)),
-        (format!("SoC: {}", app_state.rk_model), format!("Kernel: {}", kernel)),
+        (format!("Board: {}", app_state.board_name), format!("Host: {}", app_state.hostname)),
+        (format!("SoC: {}", app_state.rk_model), format!("Kernel: {}", app_state.kernel_version)),
         (format!("NPU Driver:    {}", app_state.npu_version), format!("Arch: {}", app_state.cpu_arch)),
-        (format!("RGA Driver:    {}", app_state.rga_version), String::new()),
-        (format!("RKNN Runtime:  {}", app_state.rknn_version), String::new()),
+        (format!("RGA Driver:    {}", app_state.rga_version), ai_card),
+        (format!("RKNN Runtime:  {}", app_state.rknn_version), ai_pcie),
         (format!("RKLLM Runtime: {}", app_state.rkllm_version), String::new()),
     ];
 
@@ -882,6 +920,93 @@ fn render_system_panel(f: &mut Frame, area: Rect, app_state: &AppState) {
     .column_spacing(1);
 
     f.render_widget(table, area);
+}
+
+fn render_accelerator_panel(f: &mut Frame, area: Rect, app_state: &AppState) {
+    let metrics = app_state.accelerator.as_ref().and_then(|m| m.get_metrics());
+    let chip = app_state
+        .accelerator
+        .as_ref()
+        .map(|m| m.chip_name())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("RK1828");
+
+    let title = format!("AI Accelerator ({})", chip);
+
+    let mut lines = Vec::new();
+
+    if let Some(m) = metrics {
+        let bar_width: usize = 24;
+
+        // NPU Load bar
+        let npu_filled = ((m.npu_load_pct as f32 / 100.0) * bar_width as f32) as usize;
+        let npu_bar = "█".repeat(npu_filled) + &"░".repeat(bar_width.saturating_sub(npu_filled));
+        lines.push(Line::from(vec![
+            Span::raw("NPU  "),
+            Span::styled(npu_bar, Style::default().fg(Color::Magenta)),
+            Span::raw(format!(" {:>3}% @ {} MHz", m.npu_load_pct, m.npu_freq_mhz)),
+        ]));
+
+        // VRAM Gauge
+        let mem_pct = if m.memory_total_mb > 0 {
+            ((m.memory_used_mb as f64 / m.memory_total_mb as f64) * 100.0) as usize
+        } else {
+            0
+        };
+        let mem_filled = ((mem_pct as f32 / 100.0) * bar_width as f32) as usize;
+        let mem_bar = "█".repeat(mem_filled) + &"░".repeat(bar_width.saturating_sub(mem_filled));
+        lines.push(Line::from(vec![
+            Span::raw("VRAM "),
+            Span::styled(mem_bar, Style::default().fg(Color::Magenta)),
+            Span::raw(format!(" {:>3}% | {} / {} MB", mem_pct, m.memory_used_mb, m.memory_total_mb)),
+        ]));
+
+        // CPU & Clock
+        let cpu_filled = ((m.cpu_load_pct as f32 / 100.0) * bar_width as f32) as usize;
+        let cpu_bar = "█".repeat(cpu_filled) + &"░".repeat(bar_width.saturating_sub(cpu_filled));
+        lines.push(Line::from(vec![
+            Span::raw("CPU  "),
+            Span::styled(cpu_bar, Style::default().fg(Color::Magenta)),
+            Span::raw(format!(" {:>3}% @ {} MHz", m.cpu_load_pct, m.cpu_freq_mhz)),
+        ]));
+
+        // Thermals & Status
+        let temp_str = m
+            .temp_celsius
+            .map(|t| format!("{}°C", t))
+            .unwrap_or_else(|| "N/A".to_string());
+        let power_str = m
+            .power_mw
+            .map(|p| format!(" | {:.2}W", p as f64 / 1000.0))
+            .unwrap_or_default();
+
+        lines.push(Line::from(vec![
+            Span::raw("Temp: "),
+            Span::styled(temp_str, Style::default().fg(Color::White)),
+            Span::raw(format!(" | Status: {} | PCIe: {}{}", m.health, m.bus_id, power_str)),
+        ]));
+
+        // Sparkline if we have room and history
+        if area.height >= 7 && !app_state.accelerator_history.is_empty() {
+            let sparkline = render_sparkline(&app_state.accelerator_history, 100.0);
+            lines.push(Line::from(vec![
+                Span::raw("History: "),
+                Span::styled(sparkline, Style::default().fg(Color::Magenta)),
+            ]));
+        }
+    } else {
+        lines.push(Line::from(vec![
+            Span::styled("Streaming accelerator telemetry...", Style::default().fg(Color::DarkGray)),
+        ]));
+    }
+
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Magenta));
+
+    let paragraph = Paragraph::new(lines).block(block);
+    f.render_widget(paragraph, area);
 }
 
 fn render_gpu_panel(f: &mut Frame, area: Rect, app_state: &AppState) {

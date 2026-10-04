@@ -1,10 +1,10 @@
 [package]
-name = "rktop"
-version = "0.1.5"
+name = "rktop-ai"
+version = "0.2.0"
 edition = "2021"
-authors = ["Alex Jokela <alex@camulus.com>"]
+authors = ["Alex Jokela <alex@camulus.com>", "Piotr Błażejewicz (Peter Blazejewicz) (@peterblazejewicz) <peterblazejewicz@users.noreply.github.com>"]
 license = "BSD-3-Clause"
-description = "High-performance system monitor for Rockchip SoCs (RK3588, RK3399) with real-time CPU, GPU, NPU, RGA, memory, and process monitoring"
+description = "High-performance system and PCIe AI accelerator monitor for Rockchip platforms (RK3576, RK3588, RK1828) with real-time CPU, GPU, NPU, and VRAM monitoring"
 repository = "https://github.com/ajokela/rktop"
 readme = "README.md"
 keywords = ["rockchip", "system-monitor", "rk3588", "embedded", "tui"]
@@ -18,6 +18,7 @@ regex = "1.11"
 anyhow = "1.0"
 thiserror = "2.0"
 nix = { version = "0.29", features = ["user", "fs"] }
+libc = "0.2"
 goblin = "0.9"
 
 [profile.release]
