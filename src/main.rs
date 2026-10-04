@@ -574,9 +574,11 @@ fn ui(f: &mut Frame, sys: &System, app_state: &AppState) {
     let size = f.area();
 
     // Main layout: top and bottom
+    // When AI accelerator or multiple coprocessors are present, give ~58% to the top hardware stack
+    let top_pct = if app_state.has_accelerator { 58 } else { 50 };
     let main_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(20), Constraint::Percentage(50)])
+        .constraints([Constraint::Percentage(top_pct), Constraint::Min(12)])
         .split(size);
 
     // Top layout: left and right
@@ -938,6 +940,15 @@ fn render_accelerator_panel(f: &mut Frame, area: Rect, app_state: &AppState) {
     if let Some(m) = metrics {
         let bar_width: usize = 24;
 
+        // Sparkline history on top (similar to CPU panel)
+        if !app_state.accelerator_history.is_empty() {
+            let sparkline = render_sparkline(&app_state.accelerator_history, 100.0);
+            lines.push(Line::from(vec![
+                Span::raw("History: "),
+                Span::styled(sparkline, Style::default().fg(Color::Magenta)),
+            ]));
+        }
+
         // NPU Load bar
         let npu_filled = ((m.npu_load_pct as f32 / 100.0) * bar_width as f32) as usize;
         let npu_bar = "█".repeat(npu_filled) + &"░".repeat(bar_width.saturating_sub(npu_filled));
@@ -985,15 +996,6 @@ fn render_accelerator_panel(f: &mut Frame, area: Rect, app_state: &AppState) {
             Span::styled(temp_str, Style::default().fg(Color::White)),
             Span::raw(format!(" | Status: {} | PCIe: {}{}", m.health, m.bus_id, power_str)),
         ]));
-
-        // Sparkline if we have room and history
-        if area.height >= 7 && !app_state.accelerator_history.is_empty() {
-            let sparkline = render_sparkline(&app_state.accelerator_history, 100.0);
-            lines.push(Line::from(vec![
-                Span::raw("History: "),
-                Span::styled(sparkline, Style::default().fg(Color::Magenta)),
-            ]));
-        }
     } else {
         lines.push(Line::from(vec![
             Span::styled("Streaming accelerator telemetry...", Style::default().fg(Color::DarkGray)),
@@ -1052,28 +1054,25 @@ fn render_npu_panel(f: &mut Frame, area: Rect, app_state: &AppState) {
     let freq = get_npu_frequency();
     let freq_str = freq.map(|f| format!(" {} MHz", f)).unwrap_or_default();
 
-    let mut lines: Vec<Line> = loads
-        .iter()
-        .enumerate()
-        .map(|(i, &load)| {
-            let bar_width = 20;
-            let filled = ((load as f32 / 100.0) * bar_width as f32) as usize;
-            let bar = "█".repeat(filled) + &"░".repeat(bar_width - filled);
-            Line::from(vec![
-                Span::raw(format!("Core {} ", i)),
-                Span::styled(bar, Style::default().fg(Color::Green)),
-                Span::raw(format!(" {:>3}%{}", load, if i == 0 { freq_str.as_str() } else { "" })),
-            ])
-        })
-        .collect();
+    let mut lines = Vec::new();
 
-    // Add sparkline if we have history (showing average across all cores)
+    // Add sparkline if we have history (showing average across all cores on top, matching CPU panel)
     if !app_state.npu_history.is_empty() {
         let sparkline = render_sparkline(&app_state.npu_history, 100.0);
-        lines.push(Line::from(""));
         lines.push(Line::from(vec![
             Span::raw("History: "),
             Span::styled(sparkline, Style::default().fg(Color::Green)),
+        ]));
+    }
+
+    for (i, &load) in loads.iter().enumerate() {
+        let bar_width = 20;
+        let filled = ((load as f32 / 100.0) * bar_width as f32) as usize;
+        let bar = "█".repeat(filled) + &"░".repeat(bar_width - filled);
+        lines.push(Line::from(vec![
+            Span::raw(format!("Core {} ", i)),
+            Span::styled(bar, Style::default().fg(Color::Green)),
+            Span::raw(format!(" {:>3}%{}", load, if i == 0 { freq_str.as_str() } else { "" })),
         ]));
     }
 
