@@ -10,7 +10,8 @@ use crate::hardware::{
     get_rga_load, get_thermal_cached,
 };
 use crate::sysinfo_ext::{
-    get_tracked_processes, get_zram_info, is_secondary_thread, ProcessAffinityProfile, ZramInfo,
+    get_tracked_processes, get_zram_info, process_matches_patterns, ProcessAffinityProfile,
+    ZramInfo,
 };
 use crate::AppState;
 
@@ -318,41 +319,12 @@ pub fn stream_json_snapshots(
 
     let current_pid = std::process::id();
     let find_pids = |system: &System| -> Vec<sysinfo::Pid> {
-        let mut pids = Vec::new();
-        for (pid, process) in system.processes() {
-            let pid_u32 = pid.as_u32();
-            if pid_u32 == current_pid || is_secondary_thread(pid_u32) {
-                continue;
-            }
-            let name = process.name().to_string_lossy();
-            let name_lower = name.to_lowercase();
-            if name_lower == "sudo" || name_lower == "timeout" || name_lower == "rktop-ai" || name_lower == "grep" {
-                continue;
-            }
-            let exe_name = process
-                .exe()
-                .and_then(|p| p.file_name())
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_default();
-            let matches = tracked_patterns.iter().any(|pat| {
-                let pat_lower = pat.to_lowercase();
-                if name_lower.contains(&pat_lower) || exe_name.to_lowercase().contains(&pat_lower) {
-                    return true;
-                }
-                let cmd = process.cmd();
-                if cmd.len() >= 2 {
-                    let first_arg = cmd[1].to_string_lossy().to_lowercase();
-                    if first_arg.contains(&pat_lower) {
-                        return true;
-                    }
-                }
-                false
-            });
-            if matches {
-                pids.push(*pid);
-            }
-        }
-        pids
+        system
+            .processes()
+            .iter()
+            .filter(|(_, process)| process_matches_patterns(process, tracked_patterns, current_pid))
+            .map(|(pid, _)| *pid)
+            .collect()
     };
 
     let mut tracked_pids = if !tracked_patterns.is_empty() {

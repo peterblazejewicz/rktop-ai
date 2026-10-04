@@ -77,6 +77,62 @@ pub fn is_accelerator_present() -> bool {
     false
 }
 
+/// Query rknn-smi with specific -t flag (e.g. "work_mode", "memory", "npu_freq")
+pub fn query_rknn_smi_type(arg: &str) -> Option<String> {
+    let output = Command::new("/bin/rknn-smi")
+        .args(["info", "-t", arg])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+/// Parse mode string (e.g. "PERFORMANCE", "NORMAL", "EFFICIENT", "0", "1", "2")
+pub fn parse_mode_string(text: &str) -> Option<String> {
+    let upper = text.to_uppercase();
+    if upper.contains("PERFORMANCE") || upper.contains(" 2") || upper.ends_with(": 2") {
+        Some("PERFORMANCE".to_string())
+    } else if upper.contains("NORMAL") || upper.contains(" 1") || upper.ends_with(": 1") {
+        Some("NORMAL".to_string())
+    } else if upper.contains("EFFICIENT") || upper.contains(" 0") || upper.ends_with(": 0") {
+        Some("EFFICIENT".to_string())
+    } else {
+        text.split_whitespace()
+            .last()
+            .map(|s| s.trim_matches(|c: char| !c.is_alphanumeric()).to_uppercase())
+            .filter(|s| !s.is_empty())
+    }
+}
+
+/// Parse single frequency from text (e.g. "400", "400MHz", "400 MHz", "Frequency: 400")
+pub fn parse_first_freq(text: &str) -> Option<u32> {
+    static RE_NUM: OnceLock<Regex> = OnceLock::new();
+    let re = RE_NUM.get_or_init(|| Regex::new(r"(\d+)").unwrap());
+    re.captures(text)?.get(1)?.as_str().parse::<u32>().ok()
+}
+
+/// Parse list of frequencies from text (e.g. "400, 500, 850", "[400, 500, 850]")
+pub fn parse_freq_list(text: &str) -> Vec<u32> {
+    static RE_NUMS: OnceLock<Regex> = OnceLock::new();
+    let re = RE_NUMS.get_or_init(|| Regex::new(r"(\d+)").unwrap());
+    let mut freqs = Vec::new();
+    for cap in re.captures_iter(text) {
+        if let Ok(freq) = cap[1].parse::<u32>() {
+            freqs.push(freq);
+        }
+    }
+    freqs.sort_unstable();
+    freqs.dedup();
+    freqs
+}
+
 /// Query static accelerator details (Chip Name, Bus-Id, Modes, DDR rate) using `rknn-smi`.
 /// Note: rknn-smi info may exit with status 251 (0xFB) despite valid output.
 pub fn query_accelerator_static_info() -> Option<AcceleratorStaticInfo> {
@@ -90,33 +146,26 @@ pub fn query_accelerator_static_info() -> Option<AcceleratorStaticInfo> {
     let text = String::from_utf8_lossy(&output.stdout);
     let (chip_name, bus_id) = parse_static_info(&text)?;
 
-    let mut work_mode = None;
-    let mut prefill_mode = None;
-    let mut ddr_freq_mhz = None;
-    let mut available_npu_freqs_mhz = Vec::new();
+    // Query exact vendor metrics via rknn-smi info -t <target>
+    let mut work_mode = query_rknn_smi_type("work_mode").and_then(|s| parse_mode_string(&s));
+    let mut prefill_mode = query_rknn_smi_type("prefill_mode").and_then(|s| parse_mode_string(&s));
+    let mut ddr_freq_mhz = query_rknn_smi_type("memory").and_then(|s| parse_first_freq(&s));
+    let mut available_npu_freqs_mhz = query_rknn_smi_type("npu_freq")
+        .map(|s| parse_freq_list(&s))
+        .unwrap_or_default();
 
-    parse_extended_info_text(&text, &mut work_mode, &mut prefill_mode, &mut ddr_freq_mhz, &mut available_npu_freqs_mhz);
-
-    // Try rknn-smi info -l for additional hardware info
-    if let Ok(output_l) = Command::new("/bin/rknn-smi")
-        .args(["info", "-l"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-    {
-        let text_l = String::from_utf8_lossy(&output_l.stdout);
-        parse_extended_info_text(&text_l, &mut work_mode, &mut prefill_mode, &mut ddr_freq_mhz, &mut available_npu_freqs_mhz);
-    }
-
-    // Hardware defaults for RK1828 PCIe card if not explicitly output by SMI table
+    // Hardware defaults for RK1828 PCIe card if not explicitly output by SMI flags
     if available_npu_freqs_mhz.is_empty() && chip_name == "RK1828" {
-        available_npu_freqs_mhz = vec![500, 666, 850, 1000];
+        available_npu_freqs_mhz = vec![400, 500, 850];
     }
     if ddr_freq_mhz.is_none() && chip_name == "RK1828" {
-        ddr_freq_mhz = Some(1066);
+        ddr_freq_mhz = Some(400); // 400 MHz as verified on live RK1828 hardware
     }
     if work_mode.is_none() {
-        work_mode = Some("NORMAL".to_string());
+        work_mode = Some("PERFORMANCE".to_string());
+    }
+    if prefill_mode.is_none() {
+        prefill_mode = work_mode.clone();
     }
 
     Some(AcceleratorStaticInfo {
@@ -127,73 +176,6 @@ pub fn query_accelerator_static_info() -> Option<AcceleratorStaticInfo> {
         ddr_freq_mhz,
         available_npu_freqs_mhz,
     })
-}
-
-/// Helper to parse work_mode, prefill_mode, DDR frequency, and available frequencies from SMI text
-pub fn parse_extended_info_text(
-    text: &str,
-    work_mode: &mut Option<String>,
-    prefill_mode: &mut Option<String>,
-    ddr_freq_mhz: &mut Option<u32>,
-    available_freqs: &mut Vec<u32>,
-) {
-    static WORK_MODE_RE: OnceLock<Regex> = OnceLock::new();
-    let wm_re = WORK_MODE_RE.get_or_init(|| {
-        Regex::new(r"(?i)\b(?:work_mode|work\s*mode|mode)\s*[:=]?\s*([A-Za-z0-9_-]+)").unwrap()
-    });
-
-    static PREFILL_RE: OnceLock<Regex> = OnceLock::new();
-    let pf_re = PREFILL_RE.get_or_init(|| {
-        Regex::new(r"(?i)\b(?:prefill_mode|prefill\s*mode|prefill)\s*[:=]?\s*([A-Za-z0-9_-]+)").unwrap()
-    });
-
-    static DDR_RE: OnceLock<Regex> = OnceLock::new();
-    let ddr_re = DDR_RE.get_or_init(|| {
-        Regex::new(r"(?i)\b(?:ddr|ddr_freq|ddr_rate)\s*[:=]?\s*(\d+)").unwrap()
-    });
-
-    static FREQ_LIST_RE: OnceLock<Regex> = OnceLock::new();
-    let freq_re = FREQ_LIST_RE.get_or_init(|| {
-        Regex::new(r"(?i)\b(?:available_freqs|frequencies|freqs)\s*[:=]?\s*\[?([0-9,\s]+)\]?").unwrap()
-    });
-
-    for line in text.lines() {
-        if work_mode.is_none() {
-            if let Some(cap) = wm_re.captures(line) {
-                let m = cap[1].to_uppercase();
-                let mode_str = match m.as_str() {
-                    "0" | "EFFICIENT" => "EFFICIENT".to_string(),
-                    "1" | "NORMAL" => "NORMAL".to_string(),
-                    "2" | "PERFORMANCE" => "PERFORMANCE".to_string(),
-                    other => other.to_string(),
-                };
-                *work_mode = Some(mode_str);
-            }
-        }
-        if prefill_mode.is_none() {
-            if let Some(cap) = pf_re.captures(line) {
-                *prefill_mode = Some(cap[1].to_uppercase());
-            }
-        }
-        if ddr_freq_mhz.is_none() {
-            if let Some(cap) = ddr_re.captures(line) {
-                if let Ok(freq) = cap[1].parse::<u32>() {
-                    *ddr_freq_mhz = Some(freq);
-                }
-            }
-        }
-        if available_freqs.is_empty() {
-            if let Some(cap) = freq_re.captures(line) {
-                let list = cap[1]
-                    .split(',')
-                    .filter_map(|s| s.trim().parse::<u32>().ok())
-                    .collect::<Vec<_>>();
-                if !list.is_empty() {
-                    *available_freqs = list;
-                }
-            }
-        }
-    }
 }
 
 /// Parse chip name and bus ID from `rknn-smi info` table output.
@@ -658,5 +640,19 @@ mod tests {
         assert_eq!(parsed.memory_total_mb, 5120);
         assert_eq!(parsed.memory_used_mb, 1024);
         assert_eq!(parsed.health, "OK");
+    }
+
+    #[test]
+    fn test_vendor_flag_parsers() {
+        assert_eq!(parse_mode_string("PERFORMANCE").as_deref(), Some("PERFORMANCE"));
+        assert_eq!(parse_mode_string("work_mode: 2").as_deref(), Some("PERFORMANCE"));
+        assert_eq!(parse_mode_string("NORMAL").as_deref(), Some("NORMAL"));
+        assert_eq!(parse_mode_string("EFFICIENT").as_deref(), Some("EFFICIENT"));
+
+        assert_eq!(parse_first_freq("400 MHz"), Some(400));
+        assert_eq!(parse_first_freq("memory: 400"), Some(400));
+
+        assert_eq!(parse_freq_list("400, 500, 850"), vec![400, 500, 850]);
+        assert_eq!(parse_freq_list("npu_freq: 850, 400, 500"), vec![400, 500, 850]);
     }
 }
