@@ -111,21 +111,43 @@ pub fn parse_mode_string(text: &str) -> Option<String> {
     }
 }
 
-/// Parse single frequency from text (e.g. "400", "400MHz", "400 MHz", "Frequency: 400")
+/// Parse single frequency from text (e.g. "Device 0 Chip 0: 400 MHz", "400MHz", "400 MHz", "Frequency: 400")
+/// Skips small integers (like device index 0, chip index 0) by requiring freq >= 100 MHz,
+/// or matches explicitly against MHz pattern.
 pub fn parse_first_freq(text: &str) -> Option<u32> {
+    static RE_MHZ: OnceLock<Regex> = OnceLock::new();
+    let re_mhz = RE_MHZ.get_or_init(|| Regex::new(r"(?i)(\d+)\s*mhz").unwrap());
+    if let Some(cap) = re_mhz.captures(text) {
+        if let Ok(val) = cap[1].parse::<u32>() {
+            if val >= 50 {
+                return Some(val);
+            }
+        }
+    }
+
     static RE_NUM: OnceLock<Regex> = OnceLock::new();
     let re = RE_NUM.get_or_init(|| Regex::new(r"(\d+)").unwrap());
-    re.captures(text)?.get(1)?.as_str().parse::<u32>().ok()
+    for cap in re.captures_iter(text) {
+        if let Ok(val) = cap[1].parse::<u32>() {
+            if val >= 100 {
+                return Some(val);
+            }
+        }
+    }
+    None
 }
 
-/// Parse list of frequencies from text (e.g. "400, 500, 850", "[400, 500, 850]")
+/// Parse list of frequencies from text (e.g. "Device 0: 400, 500, 850").
+/// Filters out device and chip indices (< 100).
 pub fn parse_freq_list(text: &str) -> Vec<u32> {
     static RE_NUMS: OnceLock<Regex> = OnceLock::new();
     let re = RE_NUMS.get_or_init(|| Regex::new(r"(\d+)").unwrap());
     let mut freqs = Vec::new();
     for cap in re.captures_iter(text) {
         if let Ok(freq) = cap[1].parse::<u32>() {
-            freqs.push(freq);
+            if freq >= 100 {
+                freqs.push(freq);
+            }
         }
     }
     freqs.sort_unstable();
@@ -651,8 +673,11 @@ mod tests {
 
         assert_eq!(parse_first_freq("400 MHz"), Some(400));
         assert_eq!(parse_first_freq("memory: 400"), Some(400));
+        assert_eq!(parse_first_freq("Device 0 Chip 0: 400 MHz"), Some(400));
+        assert_eq!(parse_first_freq("Device 0 Chip 0: 400"), Some(400));
 
         assert_eq!(parse_freq_list("400, 500, 850"), vec![400, 500, 850]);
         assert_eq!(parse_freq_list("npu_freq: 850, 400, 500"), vec![400, 500, 850]);
+        assert_eq!(parse_freq_list("Device 0: 0, 1, 400, 500, 850"), vec![400, 500, 850]);
     }
 }
